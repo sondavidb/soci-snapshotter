@@ -154,6 +154,7 @@ services:
     - /var/lib/soci-snapshotter-grpc
    volumes:
     - /dev/fuse:/dev/fuse
+    - {{.ImageContextDir}}/out/coverage_integration:/test_coverage
 `
 const composeRegistryTemplate = `
 version: "3.7"
@@ -171,6 +172,7 @@ services:
    - /var/lib/soci-snapshotter-grpc
   volumes:
    - /dev/fuse:/dev/fuse
+   - {{.ImageContextDir}}/out/coverage_integration:/test_coverage
  registry:
   image: {{.RegistryImageRef}}
   container_name: {{.RegistryHost}}
@@ -203,6 +205,7 @@ services:
     - /var/lib/soci-snapshotter-grpc
     volumes:
     - /dev/fuse:/dev/fuse
+    - {{.ImageContextDir}}/out/coverage_integration:/test_coverage
   registry:
     image: {{.RegistryImageRef}}
     container_name: {{.RegistryHost}}
@@ -473,6 +476,10 @@ func newShellWithRegistry(t *testing.T, r registryConfig, opts ...registryOpt) (
 		serviceName = "testing"
 	)
 
+	pRoot, err := testutil.GetProjectRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Setup dummy creds for test
 	crt, key, err := generateRegistrySelfSignedCert(r.host)
 	if err != nil {
@@ -541,6 +548,7 @@ networks:
 
 	s, err := testutil.ApplyTextTemplate(composeRegistryTemplate, dockerComposeYaml{
 		ServiceName:      serviceName,
+		ImageContextDir:  pRoot,
 		RegistryHost:     r.host,
 		RegistryImageRef: rOpts.registryImageRef,
 		HostVolumeMount:  hostVolumeMount,
@@ -585,7 +593,17 @@ func newSnapshotterBaseShell(t *testing.T) (*shell.Shell, func() error) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := compose.Up(composeDefaultTemplate, compose.WithBuildArgs(buildArgs...), compose.WithStdio(testutil.TestingLogDest()))
+	pRoot, err := testutil.GetProjectRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := testutil.ApplyTextTemplate(composeDefaultTemplate, dockerComposeYaml{
+		ImageContextDir: pRoot,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := compose.Up(s, compose.WithBuildArgs(buildArgs...), compose.WithStdio(testutil.TestingLogDest()))
 	if err != nil {
 		t.Fatalf("failed to prepare compose: %v", err)
 	}

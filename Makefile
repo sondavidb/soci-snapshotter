@@ -44,9 +44,15 @@ CMD=soci-snapshotter-grpc soci
 
 CMD_BINARIES=$(addprefix $(OUTDIR)/,$(CMD))
 
+PACKAGE_LIST_CMD=go list -f '{{.ImportPath}}' ./... | paste -sd ","
+
+SOCI_LIBRARY_PACKAGE_LIST=$(shell $(PACKAGE_LIST_CMD))
+SOCI_CLI_PACKAGE_LIST=$(shell echo $(SOCI_LIBRARY_PACKAGE_LIST),$(shell cd $(SOCI_SNAPSHOTTER_PROJECT_ROOT)/cmd/soci && $(PACKAGE_LIST_CMD)))
+SOCI_GRPC_PACKAGE_LIST=$(shell echo $(SOCI_LIBRARY_PACKAGE_LIST),$(shell cd $(SOCI_SNAPSHOTTER_PROJECT_ROOT)/cmd/soci-snapshotter-grpc && $(PACKAGE_LIST_CMD)))
+
 GO_BENCHMARK_TESTS?=.
 
-.PHONY: all build check add-ltag install uninstall clean test integration release benchmarks build-benchmarks benchmarks-perf-test benchmarks-comparison-test
+.PHONY: all build check add-ltag install uninstall clean test integration coverage release benchmarks build-benchmarks benchmarks-perf-test benchmarks-comparison-test
 
 all: build
 
@@ -89,11 +95,48 @@ test:
 	@echo "$@"
 	@GO111MODULE=$(GO111MODULE_VALUE) go test $(GO_TEST_FLAGS) $(GO_LD_FLAGS) -race ./...
 
-
 integration: build
 	@echo "$@"
 	@echo "SOCI_SNAPSHOTTER_PROJECT_ROOT=$(SOCI_SNAPSHOTTER_PROJECT_ROOT)"
 	@GO111MODULE=$(GO111MODULE_VALUE) SOCI_SNAPSHOTTER_PROJECT_ROOT=$(SOCI_SNAPSHOTTER_PROJECT_ROOT) ENABLE_INTEGRATION_TEST=true go test $(GO_TEST_FLAGS) -v -timeout=0 ./integration
+
+coverage:
+	@echo "$@"
+	@GO_BUILD_FLAGS='$(GO_BUILD_FLAGS) -coverpkg=$(SOCI_CLI_PACKAGE_LIST)' make soci
+	@GO_BUILD_FLAGS='$(GO_BUILD_FLAGS) -coverpkg=$(SOCI_GRPC_PACKAGE_LIST)' make soci-snapshotter-grpc
+
+	rm -rf $(OUTDIR)/coverage_integration && mkdir -p $(OUTDIR)/coverage_integration
+	rm -rf $(OUTDIR)/coverage_unit && mkdir -p $(OUTDIR)/coverage_unit
+	rm -rf $(OUTDIR)/coverage_total && mkdir -p $(OUTDIR)/coverage_total
+	rm -rf $(OUTDIR)/coverage_out && mkdir -p $(OUTDIR)/coverage_out
+
+	@echo "integration with coverage"
+	@echo "SOCI_SNAPSHOTTER_PROJECT_ROOT=$(SOCI_SNAPSHOTTER_PROJECT_ROOT)"
+	@GO111MODULE=$(GO111MODULE_VALUE) SOCI_SNAPSHOTTER_PROJECT_ROOT=$(SOCI_SNAPSHOTTER_PROJECT_ROOT) ENABLE_INTEGRATION_TEST=true go test $(GO_TEST_FLAGS) -v -timeout=0 ./integration
+
+# Don't use -race top combine results with with integration testing
+	@echo "test with coverage"
+	GO111MODULE=$(GO111MODULE_VALUE) go test $(GO_TEST_FLAGS) $(GO_LD_FLAGS) ./... -args -test.gocoverdir=$(OUTDIR)/coverage_unit
+
+# Convert into readable data
+	go tool covdata textfmt -i coverage_unit -o coverage_unit/cover.out
+	go tool cover -html=coverage_unit/cover.out -o coverage_unit/cover.html
+
+	cd cmd
+
+	go tool covdata textfmt -i ../coverage_integration -o ../coverage_integration/cover.out
+	go tool cover -html=../coverage_integration/cover.out -o ../coverage_integration/cover.html
+
+	go tool covdata merge -i=../coverage_unit,../coverage_integration -o ../coverage_total
+	go tool covdata textfmt -i ../coverage_total -o ../coverage_total/cover.out
+	go tool cover -html=../coverage_total/cover.out -o=../coverage_total/cover.html
+
+	cd ../
+
+	cp coverage_unit/cover.html coverage_out/coverage_unit.html
+	cp coverage_integration/cover.html coverage_out/coverage_integration.html
+	cp coverage_total/cover.html coverage_out/coverage_total.html
+	go tool covdata percent -i=coverage_total > coverage_out/cover_percentages.txt
 
 release:
 	@echo "$@"

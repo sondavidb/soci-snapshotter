@@ -25,6 +25,7 @@ ARG RUNC_VERSION
 ARG NERDCTL_VERSION
 ARG GO_VERSION
 ARG TARGETARCH
+ENV GOCOVERDIR=/test_coverage
 COPY ./integ_entrypoint.sh /integ_entrypoint.sh
 COPY . $GOPATH/src/github.com/awslabs/soci-snapshotter
 ENV GOPROXY direct
