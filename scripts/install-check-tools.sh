@@ -17,11 +17,14 @@
 echo "Install soci check tools"
 set -eux -o pipefail
 
-curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v1.56.2
+golangci_lint_ver="1.56.2"
+curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v"${golangci_lint_ver}"
+# TODO: Verify script integrity via checksums
 go install github.com/kunalkushwaha/ltag@v0.2.4
 go install github.com/vbatts/git-validation@v1.2.0
 
 scversion="v0.10.0"
 arch=$(uname -m)
 wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${scversion?}/shellcheck-${scversion?}.linux.${arch}.tar.xz" | tar -xJv
+# TODO: Verify script integrity via checksums
 cp "shellcheck-${scversion}/shellcheck" "$(go env GOPATH)"/bin/

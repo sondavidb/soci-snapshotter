@@ -22,10 +22,24 @@ set -eux -o pipefail
 TMPDIR=$(mktemp -d)
 pushd "${TMPDIR}"
 
+arch="$(uname -m)"
+
 # install cmake
+cmake_ver="3.24.1"
 if ! command -v cmake &> /dev/null
 then
-    wget https://github.com/Kitware/CMake/releases/download/v3.24.1/cmake-3.24.1-Linux-x86_64.sh -O cmake.sh
+    wget https://github.com/Kitware/CMake/releases/download/v"${cmake_ver}"/cmake-"${cmake_ver}"-Linux-"${arch}".sh -O cmake.sh
+    wget https://github.com/Kitware/CMake/releases/download/v"${cmake_ver}"/cmake-"${cmake_ver}"-SHA-256.txt -O sha256sums.txt
+
+    # Verify integrity
+    expected_shasum="$(grep "${arch}".sh < sha256sums.txt | awk '{print $1}')"
+    actual_shasum="$(sha256sum cmake.sh | awk '{print $1}')"
+    if [ "${expected_shasum}" != "${actual_shasum}" ]
+    then
+        echo "error: cmake sha256sum did not match"
+        exit 1
+    fi
+    
     sh cmake.sh --prefix=/usr/local/ --exclude-subdir
     rm -rf cmake.sh
 else
@@ -33,22 +47,26 @@ else
 fi
 
 # install flatc
+flatc_ver="v2.0.8"
 if ! command -v flatc &> /dev/null
 then
-    wget https://github.com/google/flatbuffers/archive/refs/tags/v2.0.8.tar.gz -O flatbuffers.tar.gz
+    wget https://github.com/google/flatbuffers/archive/refs/tags/"${flatc_ver}".tar.gz -O flatbuffers.tar.gz
+    # TODO: Verify script integrity via checksums
     tar xzvf flatbuffers.tar.gz
-    cd flatbuffers-2.0.8 && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release && make && sudo make install && cd ..
+    cd flatbuffers-"${flatc_ver}" && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release && make && sudo make install && cd ..
     rm -f flatbuffers.tar.gz
-    rm -rf flatbuffers-2.0.8
+    rm -rf flatbuffers-"${flatc_ver}"
 else
     echo "flatc is installed, skip..."
 fi
 
 # install-zlib
-wget https://zlib.net/fossils/zlib-1.2.12.tar.gz
-tar xzvf zlib-1.2.12.tar.gz
-cd zlib-1.2.12 && ./configure && sudo make install && cd ..
-rm -rf zlib-1.2.12
-rm -f zlib-1.2.12.tar.gz
+zlib_ver="1.2.12"
+wget https://zlib.net/fossils/zlib-"${zlib_ver}".tar.gz -O zlib.tar.gz
+# TODO: Verify script integrity via checksums
+tar xzvf zlib.tar.gz
+cd zlib-"${zlib_ver}" && ./configure && sudo make install && cd ..
+rm -rf zlib-"${zlib_ver}"
+rm -f zlib.tar.gz
 
 popd
