@@ -1,10 +1,12 @@
 name: Update getting started guide
 
 on:
+  create:
+    branches: ['release/**']
   release:
     types: ['released']
   pull_request:
-    branches: ['main', 'release/**']
+    branches: ['main']
     paths:
       # Run workflow on changes to the workflow definition itself to spot check
       # the core version update functionality.
@@ -13,15 +15,15 @@ on:
       # Run workflow on changes to the getting started guide to validate
       # changes to the documentation do not break the update workflow.
       - 'docs/getting-started.md'
+      - 'docs/eks.md'
+  # Run workflow on all pushes to a release branch
+  push:
+    branches: ['release/**']
 
 jobs:
   test-update-version:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04
-
-    permissions:
-      contents: read
-      pull-requests: read
 
     steps:
       - uses: actions/checkout@v6
@@ -35,17 +37,37 @@ jobs:
         run: bash scripts/update-getting-started-guide-version.sh --assert v0.0.0-${{ github.event.pull_request.number }}
 
   update-version:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || github.event_name == 'push' || github.event_name == 'create'
     runs-on: ubuntu-22.04
+
+    env:
+      TAG_NAME: '' # Set in steps
 
     permissions:
       # Write permissions needed to create pull request.
-      # Risk is mitigated by seperating jobs such that workflows
-      # running with write permissions only use code from main.
+      # Risk for pwn requests is mitigated by seperating jobs such that
+      # workflows running with write permissions only use code from main.
       contents: write
       pull-requests: write
 
     steps:
+      - name: "Set tag name for create"
+        if: github.event_name == 'create'
+        run: |
+          branch_name=${{ github.ref_name }}
+          major_minor=${branch_name#*/}
+          echo "TAG_NAME=v${major_minor}.0" >> $GITHUB_ENV
+      - name: "Set tag name for release"
+        if: github.event_name == 'release'
+        run: echo "TAG_NAME=${{ env.TAG_NAME }}" >> $GITHUB_ENV
+      - name: "Set tag name for push"
+        if: github.event_name == 'push'
+        run: |
+          # curl GitHub API to get latest tag
+          latest_tag=$(curl -s https://api.github.com/repos/awslabs/soci-snapshotter/releases| grep "tag_name" | cut -d '"' -f 4 | head -n 1)
+
+          # Increment patch ver
+          echo "TAG_NAME=$(echo ${latest_tag} | awk -F. -v OFS=. '{$NF += 1 ; print}')" >> $GITHUB_ENV
       - uses: actions/checkout@v6
         with:
           ref: main
@@ -55,13 +77,13 @@ jobs:
             scripts/update-getting-started-guide-version.sh
 
       - name: Update getting started version
-        run: bash scripts/update-getting-started-guide-version.sh --verbose ${{ github.event.release.tag_name }}
+        run: bash scripts/update-getting-started-guide-version.sh --verbose ${{ env.TAG_NAME }}
 
       - name: Create PR
         uses: peter-evans/create-pull-request@v8
         with:
-          title: 'Update getting started to ${{ github.event.release.tag_name }}'
-          commit-message: 'Update getting started to ${{ github.event.release.tag_name }}'
+          title: 'Update version in docs to ${{ env.TAG_NAME }}'
+          commit-message: 'Update version in docs to ${{ env.TAG_NAME }}'
           body: |
             This PR must be closed and reopened manually to trigger automated checks.
 
@@ -70,6 +92,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           author: "GitHub <no-reply@github.com>"
           signoff: true
-          branch: 'create-pull-request/update-getting-started-version-to-${{ github.event.release.tag_name }}'
+          branch: 'create-pull-request/update-version-in-docs-to-${{ env.TAG_NAME }}'
           base: main
           delete-branch: true
