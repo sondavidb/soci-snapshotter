@@ -4,7 +4,7 @@ on:
   release:
     types: ['released']
   pull_request:
-    branches: ['main', 'release/**']
+    branches: ['main']
     paths:
       # Run workflow on changes to the workflow definition itself to spot check
       # the core version update functionality.
@@ -13,6 +13,9 @@ on:
       # Run workflow on changes to the getting started guide to validate
       # changes to the documentation do not break the update workflow.
       - 'docs/getting-started.md'
+  # Run workflow on all pushes to a release branch
+  push:
+    branches: ['release/**']
 
 jobs:
   test-update-version:
@@ -35,17 +38,30 @@ jobs:
         run: bash scripts/update-getting-started-guide-version.sh --assert v0.0.0-${{ github.event.pull_request.number }}
 
   update-version:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || github.event_name == 'push'
     runs-on: ubuntu-22.04
+    env:
+      TAG_NAME: '' # Set in steps
 
     permissions:
       # Write permissions needed to create pull request.
-      # Risk is mitigated by seperating jobs such that workflows
-      # running with write permissions only use code from main.
+      # Risk for pwn requests is mitigated by seperating jobs such that
+      # workflows running with write permissions only use code from main.
       contents: write
       pull-requests: write
 
     steps:
+      - name: "Set tag name for release"
+        if: github.event_name == 'release'
+        run: echo "RELEASE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+      - name: "Set tag name for push"
+        if: github.event_name == 'push'
+        run: |
+          # curl GitHub API to get latest tag
+          latest_tag=$(curl -s https://api.github.com/repos/awslabs/soci-snapshotter/releases| grep "tag_name" | cut -d '"' -f 4 | head -n 1)
+          
+          # Increment patch ver
+          echo "RELEASE_TAG=$(echo ${latest_tag} | awk -F. -v OFS=. '{$NF += 1 ; print}')" >> $GITHUB_ENV
       - uses: actions/checkout@v6
         with:
           ref: main
