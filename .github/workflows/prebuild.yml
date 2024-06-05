@@ -12,7 +12,7 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-20.04
+    runs-on: ${{ 'github.event.pull_request.head.repo.fork '  && 'ubuntu-20.04' || 'codebuild-soci-visualization-workflow-${{ github.run_id }}-${{ github.run_attempt }}-ubuntu-7.0-xlarge' }}
     steps:
       - uses: actions/checkout@v4
         with:
