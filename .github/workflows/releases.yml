@@ -11,63 +11,98 @@ on:
       - 'scripts/**'
       - 'Makefile'
 
-env:
-  GO_VERSION: '1.21.12'
-
 permissions:
   contents: write
   deployments: write
 
 jobs:
-  generate-artifacts:
+  setup:
+    # Taken from build.yml
+    name: Setup Build Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - use-codebuild: ${{ github.repository_owner == 'awslabs' }}
+            runs-on-names-cb: [amd64, arm64]
+            runs-on-names-gh: [amd64]
+            runner-labels:
+              amd64: ubuntu-22.04
+              arm64: "codebuild-soci-snapshotter-instance-${{ github.run_id }}-${{ github.run_attempt }}-arm-3.0-large"
+    outputs:
+      available-runners: ${{ matrix.use-codebuild && toJSON(matrix.runs-on-names-cb) || toJSON(matrix.runs-on-names-gh) }}
+      runner-labels: ${{ toJSON(matrix.runner-labels) }}
+    steps:
+      - name: Dump Config
+        run: echo '${{ toJSON(matrix) }}'
+  global-vars:
     runs-on: ubuntu-20.04
     env:
       # Set during setup.
       RELEASE_TAG: ''
-      DYNAMIC_BINARY_NAME: ''
-      STATIC_BINARY_NAME: ''
+      RELEASE_VERSION: ''
     steps:
       - uses: actions/checkout@v4
       - name: Export cleaned release tag
         run: |
           export release_tag=${GITHUB_REF#refs/*/} # Strip down to raw tag name
+          export release_version=${release_tag/v/} # Remove v from tag name
           echo "RELEASE_TAG=${release_tag}" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${release_version}" >> $GITHUB_ENV
       - name: Create dummy environment for release
         if: github.event_name == 'pull_request'
         run: |
           touch THIRD_PARTY_LICENSES
           echo "RELEASE_TAG=v0.0.0" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=0.0.0" >> $GITHUB_ENV
+    outputs:
+      release_tag: ${{ env.RELEASE_TAG }}
+      release_version: ${{ env.RELEASE_VERSION }}
+
+  generate-artifacts:
+    needs: [setup, global-vars]
+    runs-on: ${{ fromJSON(needs.setup.outputs.runner-labels)[matrix.os] }}
+    strategy:
+      matrix:
+        os: ${{ fromJSON(needs.setup.outputs.available-runners) }}
+    env:
+      DYNAMIC_BINARY_NAME_amd64: ''
+      STATIC_BINARY_NAME_amd64: ''
+      DYNAMIC_BINARY_NAME_arm64: ''
+      STATIC_BINARY_NAME_arm64: ''
+    steps:
       - name: Setup variables and release directories
         run: |
-          export release_tag=${{ env.RELEASE_TAG }}
-          export release_version=${release_tag/v/} # Remove v from tag name
-          echo "DYNAMIC_BINARY_NAME=soci-snapshotter-${release_version}-linux-amd64.tar.gz" >> $GITHUB_ENV
-          echo "STATIC_BINARY_NAME=soci-snapshotter-${release_version}-linux-amd64-static.tar.gz" >> $GITHUB_ENV
+          echo "DYNAMIC_BINARY_NAME_${{ matrix.os }}=soci-snapshotter-${{ needs.global-vars.outputs.release_version }}-linux-${{ matrix.os }}.tar.gz" >> $GITHUB_ENV
+          echo "STATIC_BINARY_NAME_${{ matrix.os }}=soci-snapshotter-${{ needs.global-vars.outputs.release_version }}-linux-${{ matrix.os }}-static.tar.gz" >> $GITHUB_ENV
 
           mkdir release
       - name: Create release binaries
-        run: make RELEASE_TAG=${{ env.RELEASE_TAG }} release
+        run: make RELEASE_TAG=${{ needs.global-vars.outputs.release_tag }} release
       - uses: actions/upload-artifact@v4
         with:
           name: artifacts
           path: release/
           if-no-files-found: error
-
     outputs:
-      release_tag: ${{ env.RELEASE_TAG }}
-      dynamic_binary_name: ${{ env.DYNAMIC_BINARY_NAME }}
-      static_binary_name: ${{ env.STATIC_BINARY_NAME }}
+      dynamic_binary_name_amd64: ${{ env.DYNAMIC_BINARY_NAME_amd64 }}
+      static_binary_name_amd64: ${{ env.STATIC_BINARY_NAME_amd64 }}
+      dynamic_binary_name_arm64: ${{ env.DYNAMIC_BINARY_NAME_arm64 }}
+      static_binary_name_arm64: ${{ env.STATIC_BINARY_NAME_arm64 }}
 
   validate-artifacts:
-    needs: generate-artifacts
-    runs-on: ubuntu-20.04
+    needs: [setup, global-vars, generate-artifacts]
+    runs-on: ${{ fromJSON(needs.setup.outputs.runner-labels)[matrix.os] }}
+    strategy:
+      matrix:
+        os: ${{ fromJSON(needs.setup.outputs.available-runners) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: artifacts
           path: release/
-      - run: bash scripts/verify-release-artifacts.sh ${{ needs.generate-artifacts.outputs.release_tag }}
+      - run: bash scripts/verify-release-artifacts.sh ${{ needs.global-vars.outputs.release_tag }}
 
   create-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -84,7 +119,11 @@ jobs:
           prerelease: false
           generate_release_notes: false
           files: |
-            ${{ needs.generate-artifacts.outputs.dynamic_binary_name }}
-            ${{ needs.generate-artifacts.outputs.dynamic_binary_name }}.sha256sum
-            ${{ needs.generate-artifacts.outputs.static_binary_name }}
-            ${{ needs.generate-artifacts.outputs.static_binary_name }}.sha256sum
+            ${{ needs.generate-artifacts.outputs.dynamic_binary_name_amd64 }}
+            ${{ needs.generate-artifacts.outputs.dynamic_binary_name_amd64 }}.sha256sum
+            ${{ needs.generate-artifacts.outputs.static_binary_name_amd64 }}
+            ${{ needs.generate-artifacts.outputs.static_binary_name_amd64 }}.sha256sum
+            ${{ needs.generate-artifacts.outputs.dynamic_binary_name_arm64 }}
+            ${{ needs.generate-artifacts.outputs.dynamic_binary_name_arm64 }}.sha256sum
+            ${{ needs.generate-artifacts.outputs.static_binary_name_arm64 }}
+            ${{ needs.generate-artifacts.outputs.static_binary_name_arm64 }}.sha256sum
