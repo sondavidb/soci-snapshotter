@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -46,7 +48,7 @@ type Fetcher interface {
 	// and then returns a `ReadCloser`.
 	Fetch(ctx context.Context, desc ocispec.Descriptor) ([]io.ReadCloser, bool, error)
 	// Store takes in a descriptor and io.Reader and stores it in the local store.
-	Store(ctx context.Context, desc ocispec.Descriptor, reader io.Reader) error
+	Store(ctx context.Context, desc ocispec.Descriptor, reader []io.ReadCloser) error
 }
 type resolverStorage interface {
 	content.Resolver
@@ -197,23 +199,26 @@ func (f *artifactFetcher) resolve(ctx context.Context, desc ocispec.Descriptor) 
 }
 
 // Store takes in an descriptor and io.Reader and stores it in the local store.
-func (f *artifactFetcher) Store(ctx context.Context, desc ocispec.Descriptor, reader io.Reader) error {
-	err := f.localStore.Push(ctx, desc, reader)
-	if err != nil {
-		return fmt.Errorf("unable to push to local store: %w", err)
+func (f *artifactFetcher) Store(ctx context.Context, desc ocispec.Descriptor, readers []io.ReadCloser) error {
+	if f.maxPullConcurrency <= 1 {
+		err := f.localStore.Push(ctx, desc, readers[0])
+		if err != nil {
+			return fmt.Errorf("unable to push to local store: %w", err)
+		}
 	}
-	return nil
+
+	return f.StoreInParallel(ctx, desc, readers)
 }
 
 // combineReadClosers concurrently combines the readclosers into a single readcloser,
 // consuming the readers in the process.
 func combineReadClosers(rcs []io.ReadCloser, size int64) (io.ReadCloser, error) {
-	if size == 0 {
-		return nil, errors.New("size of descriptor is zero")
-	}
-
 	if len(rcs) == 1 {
 		return rcs[0], nil
+	}
+
+	if size == 0 {
+		return nil, errors.New("size of descriptor is zero")
 	}
 
 	wg := new(sync.WaitGroup)
@@ -302,13 +307,8 @@ func FetchSociArtifacts(ctx context.Context, refspec reference.Spec, indexDesc o
 			if local {
 				return nil
 			}
-			rc, err := combineReadClosers(rcs, blob.Size)
-			if err != nil {
-				return err
-			}
-			defer rc.Close()
 
-			if err := fetcher.Store(ctx, blob, rc); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
+			if err := fetcher.Store(ctx, blob, rcs); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
 				return fmt.Errorf("unable to store ztoc in local store: %w", err)
 			}
 
@@ -321,4 +321,34 @@ func FetchSociArtifacts(ctx context.Context, refspec reference.Spec, indexDesc o
 	}
 
 	return &index, nil
+}
+
+func (f *artifactFetcher) StoreInParallel(ctx context.Context, blob ocispec.Descriptor, rcs []io.ReadCloser) error {
+	sha256dir := filepath.Join("/var/lib/soci-snapshotter-grpc/content/blobs", blob.Digest.Algorithm().String())
+	err := os.MkdirAll(sha256dir, os.ModePerm)
+	if err != nil {
+		return err
+	}
+	blobPath := filepath.Join(sha256dir, blob.Digest.Encoded())
+	file, err := os.Create(blobPath)
+	if err != nil {
+		return err
+	}
+
+	wg := new(sync.WaitGroup)
+	for i, rc := range rcs {
+		wg.Add(1)
+
+		go func(i int64, rc io.ReadCloser) {
+			defer wg.Done()
+			defer rc.Close()
+
+			lower, _ := getRange(i, blob.Size, f.maxPullConcurrency)
+			content, _ := io.ReadAll(rc)
+			file.WriteAt(content, lower)
+		}(int64(i), rc)
+	}
+	wg.Wait()
+
+	return nil
 }

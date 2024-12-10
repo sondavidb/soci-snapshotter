@@ -167,7 +167,7 @@ func (f *fakeArtifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor
 	return []io.ReadCloser{io.NopCloser(bytes.NewBuffer([]byte("test")))}, f.hasLocal, nil
 }
 
-func (f *fakeArtifactFetcher) Store(ctx context.Context, desc ocispec.Descriptor, reader io.Reader) error {
+func (f *fakeArtifactFetcher) Store(ctx context.Context, desc ocispec.Descriptor, readers []io.ReadCloser) error {
 	f.storeCount++
 	if f.storeFails {
 		return fmt.Errorf("dummy error on Store()")

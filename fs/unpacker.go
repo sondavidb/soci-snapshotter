@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/archive"
 	"github.com/containerd/containerd/archive/compression"
 	"github.com/containerd/containerd/mount"
+	"github.com/containerd/log"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -73,22 +75,23 @@ func NewLayerUnpacker(fetcher Fetcher, archive Archive) Unpacker {
 }
 
 func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mountpoint string, mounts []mount.Mount) error {
+	start := time.Now().UnixMilli()
 	rcs, local, err := lu.fetcher.Fetch(ctx, desc)
 	if err != nil {
 		return fmt.Errorf("cannot fetch layer: %w", err)
 	}
 
 	if !local {
-		rc, err := combineReadClosers(rcs, desc.Size)
-		if err != nil {
-			return err
-		}
+		endRead := time.Now().UnixMilli()
+		log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("content fetched and read in %d ms", endRead-start)
 
-		err = lu.fetcher.Store(ctx, desc, rc)
+		err = lu.fetcher.Store(ctx, desc, rcs)
 		if err != nil {
 			return fmt.Errorf("got error storing: %v", err)
 		}
-		rc.Close()
+
+		endStore := time.Now().UnixMilli()
+		log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("content stored in %d ms", endStore-start)
 
 		rcs, _, err = lu.fetcher.Fetch(ctx, desc)
 		if err != nil {
