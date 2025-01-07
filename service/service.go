@@ -108,8 +108,8 @@ func NewSociSnapshotterService(ctx context.Context, root string, serviceCfg *con
 	if serviceCfg.FSConfig.MaxPullConcurrency != 0 {
 		fsOpts = append(fsOpts, socifs.WithMaxPullConcurrency(serviceCfg.FSConfig.MaxPullConcurrency))
 	}
-	if serviceCfg.FSConfig.MinConcurrencyLayerSize != 0 {
-		fsOpts = append(fsOpts, socifs.WithMinConcurrencyLayerSize(serviceCfg.FSConfig.MinConcurrencyLayerSize))
+	if serviceCfg.FSConfig.DownloadChunkSize != 0 {
+		fsOpts = append(fsOpts, socifs.WithDownloadChunkSize(serviceCfg.FSConfig.DownloadChunkSize))
 	}
 
 	fs, err := socifs.NewFilesystem(ctx, fsRoot(root), serviceCfg.FSConfig, fsOpts...)

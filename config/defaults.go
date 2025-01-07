@@ -74,8 +74,8 @@ const (
 	// defaultFuseMetricsEmitWaitDurationSec is the amount of time the snapshotter will wait before emitting the metrics for FUSE operation.
 	defaultFuseMetricsEmitWaitDurationSec = 60
 
-	// defaultMinConcurrencyLayerSize is the minimum size, in bytes, at which concurrent pull operations will occur
-	defaultMinConcurrencyLayerSize = 4 << 20 // 4 MiB
+	// defaultDownloadChunkSize is the default size, in bytes, of download requests when downloading images
+	defaultDownloadChunkSize = 1 << 24 // 16 MiB
 
 	// defaultMaxConcurrency is the maximum number of layers allowed to be pulled at once
 	defaultMaxConcurrency = 100

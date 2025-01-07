@@ -37,6 +37,7 @@ import (
 	"github.com/containerd/log"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/errdef"
 	"oras.land/oras-go/v2/registry/remote"
@@ -65,19 +66,23 @@ type artifactFetcher struct {
 	refspec     reference.Spec
 
 	maxPullConcurrency int64
-	minConcurrencySize int64
+	downloadChunkSize  int64
+	smp                *semaphore.Weighted
 }
 
 // Constructs a new artifact fetcher
 // Takes in the image reference, the local store and the resolver
-func newArtifactFetcher(refspec reference.Spec, localStore store.BasicStore, remoteStore resolverStorage, maxPullConcurrency, minConcurrencySize int64) (*artifactFetcher, error) {
-	log.G(context.Background()).Debugf("num concurrent processes: %d, min size: %d", maxPullConcurrency, minConcurrencySize)
+func newArtifactFetcher(refspec reference.Spec, localStore store.BasicStore, remoteStore resolverStorage, maxPullConcurrency, downloadChunkSize int64) (*artifactFetcher, error) {
+	log.G(context.Background()).Debugf("num concurrent processes: %d, chunk size: %d", maxPullConcurrency, downloadChunkSize)
+	// maxPullConcurrency is always >=1 so we can always do this
+	smp := semaphore.NewWeighted(maxPullConcurrency)
 	return &artifactFetcher{
 		localStore:         localStore,
 		remoteStore:        remoteStore,
 		refspec:            refspec,
 		maxPullConcurrency: maxPullConcurrency,
-		minConcurrencySize: minConcurrencySize,
+		downloadChunkSize:  downloadChunkSize,
+		smp:                smp,
 	}, nil
 }
 
@@ -102,13 +107,13 @@ func (f *artifactFetcher) constructRef(desc ocispec.Descriptor) string {
 }
 
 // returns range [lower, upper] based on index, blob size, and max concurrency
-func getRange(i, size, maxProcesses int64) (lower, upper int64) {
-	partitionSize := size / maxProcesses
-	lower = i * partitionSize
-	if i == maxProcesses-1 {
-		partitionSize += size % maxProcesses
+func getRange(i, size, chunkSize int64) (lower, upper int64) {
+	lower = i * chunkSize
+	upper = lower + chunkSize
+	if upper > size {
+		upper = size
 	}
-	upper = lower + partitionSize - 1
+	upper -= 1 // Range is inclusive
 	return lower, upper
 }
 
@@ -142,11 +147,11 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 
 	log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("layer size: %d", desc.Size)
 	// Pull at once if doesn't hit concurrency requirement
-	if desc.Size < f.minConcurrencySize || f.maxPullConcurrency <= 1 {
-		if desc.Size < f.minConcurrencySize {
-			log.G(ctx).Debugf("layer size (%d) smaller than concurrency layer size, pulling all at once", desc.Size)
+	if desc.Size <= f.downloadChunkSize || f.downloadChunkSize <= 0 {
+		if desc.Size <= f.downloadChunkSize {
+			log.G(ctx).Debugf("layer size (%d) smaller than download chunk size, pulling all at once", desc.Size)
 		} else {
-			log.G(ctx).Debugf("max_pull_concurrency is 1, pulling sequentially")
+			log.G(ctx).Debugf("download_chunk_size is negative, pulling sequentially")
 		}
 		rc, err = f.remoteStore.Fetch(ctx, desc, 0, 0)
 		if err != nil {
@@ -154,18 +159,23 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 		}
 		rcs = []io.ReadCloser{rc}
 	} else {
-		log.G(ctx).Debugf("pulling concurrently with %d processes", f.maxPullConcurrency)
+		log.G(ctx).Debugf("pulling concurrently %d bytes", desc.Size)
 
 		wg := new(sync.WaitGroup)
 		var hasErr atomic.Bool
 
-		rcs = make([]io.ReadCloser, f.maxPullConcurrency)
-		for i := range f.maxPullConcurrency {
+		numLoops := desc.Size/f.downloadChunkSize + 1
+		rcs = make([]io.ReadCloser, numLoops)
+		for i := range numLoops {
 			wg.Add(1)
+			f.smp.Acquire(ctx, 1)
 
 			go func(i int64) {
 				defer wg.Done()
-				lower, upper := getRange(i, desc.Size, f.maxPullConcurrency)
+				defer f.smp.Release(1)
+
+				lower, upper := getRange(i, desc.Size, f.downloadChunkSize)
+				log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("layer lower: %d upper: %v", lower, upper)
 				rc, err := f.remoteStore.Fetch(ctx, desc, lower, upper)
 				if err != nil {
 					log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("process %d returned error: %v", i, err)
@@ -202,7 +212,7 @@ func (f *artifactFetcher) resolve(ctx context.Context, desc ocispec.Descriptor) 
 
 // Store takes in an descriptor and io.Reader and stores it in the local store.
 func (f *artifactFetcher) Store(ctx context.Context, desc ocispec.Descriptor, readers []io.ReadCloser) error {
-	if f.maxPullConcurrency <= 1 {
+	if f.downloadChunkSize <= 0 {
 		err := f.localStore.Push(ctx, desc, readers[0])
 		if err != nil {
 			return fmt.Errorf("unable to push to local store: %w", err)
@@ -225,15 +235,24 @@ func combineReadClosers(rcs []io.ReadCloser, size int64) (io.ReadCloser, error) 
 
 	wg := new(sync.WaitGroup)
 	fullContent := make([]byte, size)
+	chunkSize := int64(0)
 	for i, rc := range rcs {
+		if i == 0 {
+			// We need to find the expected length of all the readclosers.
+			b, _ := io.ReadAll(rc)
+			chunkSize = int64(len(b))
+			copy(fullContent[0:chunkSize], b)
+			continue
+		}
+
 		wg.Add(1)
 
 		go func(i int, rc io.ReadCloser) {
 			defer wg.Done()
 			defer rc.Close()
 
-			lower, upper := getRange(int64(i), size, int64(len(rcs)))
 			b, _ := io.ReadAll(rc)
+			lower, upper := getRange(int64(i), size, chunkSize)
 			copy(fullContent[lower:upper+1], b)
 		}(i, rc)
 	}
@@ -242,8 +261,8 @@ func combineReadClosers(rcs []io.ReadCloser, size int64) (io.ReadCloser, error) 
 	return io.NopCloser(bytes.NewReader(fullContent)), nil
 }
 
-func FetchSociArtifacts(ctx context.Context, refspec reference.Spec, indexDesc ocispec.Descriptor, localStore store.Store, remoteStore resolverStorage, maxPullConcurrency, minConcurrencyLayerSize int64) (*soci.Index, error) {
-	fetcher, err := newArtifactFetcher(refspec, localStore, remoteStore, maxPullConcurrency, minConcurrencyLayerSize)
+func FetchSociArtifacts(ctx context.Context, refspec reference.Spec, indexDesc ocispec.Descriptor, localStore store.Store, remoteStore resolverStorage, maxPullConcurrency, downloadChunkSize int64) (*soci.Index, error) {
+	fetcher, err := newArtifactFetcher(refspec, localStore, remoteStore, maxPullConcurrency, downloadChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("could not create an artifact fetcher: %w", err)
 	}
@@ -349,7 +368,7 @@ func (f *artifactFetcher) StoreInParallel(ctx context.Context, blob ocispec.Desc
 
 		go func(i int64, rc io.ReadCloser) {
 			defer wg.Done()
-			lower, upper := getRange(i, blob.Size, int64(len(rcs)))
+			lower, upper := getRange(i, blob.Size, f.downloadChunkSize)
 			writeInChunks(file, rc, lower, upper)
 		}(int64(i), rc)
 	}

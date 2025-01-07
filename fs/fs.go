@@ -152,13 +152,13 @@ func (pr *preresolver) Enqueue(imgNameAndDigest string, fn func(context.Context)
 type Option func(*options)
 
 type options struct {
-	getSources              source.GetSources
-	resolveHandlers         map[string]remote.Handler
-	metadataStore           metadata.Store
-	overlayOpaqueType       layer.OverlayOpaqueType
-	maxConcurrency          int64
-	maxPullConcurrency      int64
-	minConcurrencyLayerSize int64
+	getSources         source.GetSources
+	resolveHandlers    map[string]remote.Handler
+	metadataStore      metadata.Store
+	overlayOpaqueType  layer.OverlayOpaqueType
+	maxConcurrency     int64
+	maxPullConcurrency int64
+	downloadChunkSize  int64
 }
 
 func WithGetSources(s source.GetSources) Option {
@@ -200,9 +200,9 @@ func WithMaxPullConcurrency(maxPullConcurrency int64) Option {
 	}
 }
 
-func WithMinConcurrencyLayerSize(minConcurrencyLayerSize int64) Option {
+func WithDownloadChunkSize(downloadChunkSize int64) Option {
 	return func(opts *options) {
-		opts.minConcurrencyLayerSize = minConcurrencyLayerSize
+		opts.downloadChunkSize = downloadChunkSize
 	}
 }
 
@@ -309,7 +309,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		fuseMetricsEmitWaitDuration: fuseMetricsEmitWaitDuration,
 		pr:                          pr,
 		maxPullConcurrency:          fsOpts.maxPullConcurrency,
-		minConcurrencyLayerSize:     fsOpts.minConcurrencyLayerSize,
+		downloadChunkSize:           fsOpts.downloadChunkSize,
 		layerUnpackMap:              &sync.Map{},
 		layerUnpackMu:               &namedmutex.NamedMutex{},
 	}, nil
@@ -325,7 +325,7 @@ type sociContext struct {
 	fuseOperationCounter *layer.FuseOperationCounter
 }
 
-func (c *sociContext) Init(fsCtx context.Context, ctx context.Context, imageRef, indexDigest, imageManifestDigest string, store store.Store, fuseOpEmitWaitDuration time.Duration, client *http.Client, maxPullConcurrency, minConcurrencyLayerSize int64) error {
+func (c *sociContext) Init(fsCtx context.Context, ctx context.Context, imageRef, indexDigest, imageManifestDigest string, store store.Store, fuseOpEmitWaitDuration time.Duration, client *http.Client, maxPullConcurrency, downloadChunkSize int64) error {
 	var retErr error
 	c.fetchOnce.Do(func() {
 		defer func() {
@@ -370,7 +370,7 @@ func (c *sociContext) Init(fsCtx context.Context, ctx context.Context, imageRef,
 
 		log.G(ctx).WithField("digest", indexDesc.Digest.String()).Infof("fetching SOCI artifacts using index descriptor")
 
-		index, err := FetchSociArtifacts(fsCtx, refspec, indexDesc, store, remoteStore, maxPullConcurrency, minConcurrencyLayerSize)
+		index, err := FetchSociArtifacts(fsCtx, refspec, indexDesc, store, remoteStore, maxPullConcurrency, downloadChunkSize)
 		if err != nil {
 			retErr = fmt.Errorf("%w: error trying to fetch SOCI artifacts: %w", snapshot.ErrNoIndex, err)
 			return
@@ -417,7 +417,7 @@ type filesystem struct {
 	fuseMetricsEmitWaitDuration time.Duration
 	pr                          *preresolver
 	maxPullConcurrency          int64
-	minConcurrencyLayerSize     int64
+	downloadChunkSize           int64
 
 	layerUnpackMu  *namedmutex.NamedMutex
 	layerUnpackMap *sync.Map
@@ -453,7 +453,7 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	if err != nil {
 		return fmt.Errorf("cannot create remote store: %w", err)
 	}
-	fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore, fs.maxPullConcurrency, fs.minConcurrencyLayerSize)
+	fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore, fs.maxPullConcurrency, fs.downloadChunkSize)
 	if err != nil {
 		return fmt.Errorf("cannot create fetcher: %w", err)
 	}
@@ -551,7 +551,7 @@ func (fs *filesystem) getSociContext(ctx context.Context, imageRef, indexDigest,
 	if !ok {
 		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", indexDigest)
 	}
-	err := c.Init(fs.ctx, ctx, imageRef, indexDigest, imageManifestDigest, fs.contentStore, fs.fuseMetricsEmitWaitDuration, client, fs.maxPullConcurrency, fs.minConcurrencyLayerSize)
+	err := c.Init(fs.ctx, ctx, imageRef, indexDigest, imageManifestDigest, fs.contentStore, fs.fuseMetricsEmitWaitDuration, client, fs.maxPullConcurrency, fs.downloadChunkSize)
 	return c, err
 }
 

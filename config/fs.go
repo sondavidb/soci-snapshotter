@@ -57,12 +57,11 @@ type FSConfig struct {
 	NoPrometheus                   bool   `toml:"no_prometheus"`
 	MountTimeoutSec                int64  `toml:"mount_timeout_sec"`
 	FuseMetricsEmitWaitDurationSec int64  `toml:"fuse_metrics_emit_wait_duration_sec"`
-	// MaxPullConcurrency determines how many goroutines will be used to fetch and unpack data
+	// MaxPullConcurrency determines how many total goroutines will be used to fetch and unpack data
 	MaxPullConcurrency int64 `toml:"max_fetch_concurrency"`
-	// MinConcurrencyLayerSize determines the min size, in bytes, at which we will do
-	// concurrent pull operations (i.e. any layer smaller than this will be pulled sequentially)
-	// Negative values will mean we will always do pull operations in segments of MaxPullConcurrency
-	MinConcurrencyLayerSize int64 `toml:"min_concurrency_layer_size"`
+	// DownloadChunkSize determines the maximum size of download requests when download tarballs.
+	// If set to be a negative number, layers will be downloaded in a singular request per layer.
+	DownloadChunkSize int64 `toml:"download_chunk_size"`
 
 	RetryableHTTPClientConfig `toml:"http"`
 	BlobConfig                `toml:"blob"`
@@ -197,11 +196,11 @@ func parseFSConfig(cfg *Config) {
 	if cfg.MaxPullConcurrency == 0 {
 		cfg.MaxPullConcurrency = int64(runtime.NumCPU())
 	}
-	if cfg.MinConcurrencyLayerSize == 0 {
-		cfg.MinConcurrencyLayerSize = defaultMinConcurrencyLayerSize
+	if cfg.DownloadChunkSize == 0 {
+		cfg.DownloadChunkSize = defaultDownloadChunkSize
 	}
-	if cfg.MinConcurrencyLayerSize < 0 {
-		cfg.MinConcurrencyLayerSize = 0
+	if cfg.DownloadChunkSize < 0 {
+		cfg.DownloadChunkSize = 0
 	}
 
 	if cfg.MaxConcurrency == 0 {
