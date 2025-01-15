@@ -43,9 +43,6 @@ import (
 	"oras.land/oras-go/v2/registry/remote"
 )
 
-// Max memory buffer size per process per layer. This should be moved into config.
-var maxBufferSize int64 = 1 << 20 // 1 MiB
-
 type Fetcher interface {
 	// Fetch fetches the artifact identified by the descriptor. It first checks the local content store
 	// and returns a `ReadCloser` from there. Otherwise it fetches from the remote, saves in the local content store
@@ -106,7 +103,7 @@ func (f *artifactFetcher) constructRef(desc ocispec.Descriptor) string {
 	return fmt.Sprintf("%s@%s", f.refspec.Locator, desc.Digest.String())
 }
 
-// returns range [lower, upper] based on index, blob size, and max concurrency
+// returns range [lower, upper] based on index, blob size, and chunk size
 func getRange(i, size, chunkSize int64) (lower, upper int64) {
 	lower = i * chunkSize
 	upper = lower + chunkSize
@@ -159,13 +156,14 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 		}
 		rcs = []io.ReadCloser{rc}
 	} else {
-		log.G(ctx).Debugf("pulling concurrently %d bytes", desc.Size)
 
 		wg := new(sync.WaitGroup)
 		var hasErr atomic.Bool
 
 		numLoops := desc.Size/f.downloadChunkSize + 1
 		rcs = make([]io.ReadCloser, numLoops)
+
+		log.G(ctx).Debugf("pulling concurrently %d bytes in %d loops", desc.Size, numLoops)
 		for i := range numLoops {
 			wg.Add(1)
 			f.smp.Acquire(ctx, 1)
@@ -212,12 +210,15 @@ func (f *artifactFetcher) resolve(ctx context.Context, desc ocispec.Descriptor) 
 
 // Store takes in an descriptor and io.Reader and stores it in the local store.
 func (f *artifactFetcher) Store(ctx context.Context, desc ocispec.Descriptor, readers []io.ReadCloser) error {
-	if f.downloadChunkSize <= 0 {
+	if len(readers) == 1 {
+		log.G(ctx).WithField("digest", desc.Digest.String()).Debug("store this")
 		err := f.localStore.Push(ctx, desc, readers[0])
 		if err != nil {
 			return fmt.Errorf("unable to push to local store: %w", err)
 		}
+		return nil
 	}
+	log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("parallel this: %d", len(readers))
 
 	return f.StoreInParallel(ctx, desc, readers)
 }
@@ -233,30 +234,20 @@ func combineReadClosers(rcs []io.ReadCloser, size int64) (io.ReadCloser, error) 
 		return nil, errors.New("size of descriptor is zero")
 	}
 
-	wg := new(sync.WaitGroup)
+	// Combine serially for now. If we decide to parallelize this,
+	// consider piping in an extra config variable so that we
+	// don't use too many resources combining the readclosers.
 	fullContent := make([]byte, size)
-	chunkSize := int64(0)
-	for i, rc := range rcs {
-		if i == 0 {
-			// We need to find the expected length of all the readclosers.
-			b, _ := io.ReadAll(rc)
-			chunkSize = int64(len(b))
-			copy(fullContent[0:chunkSize], b)
-			continue
-		}
-
-		wg.Add(1)
-
-		go func(i int, rc io.ReadCloser) {
-			defer wg.Done()
-			defer rc.Close()
-
-			b, _ := io.ReadAll(rc)
-			lower, upper := getRange(int64(i), size, chunkSize)
-			copy(fullContent[lower:upper+1], b)
-		}(i, rc)
+	offset := int64(0)
+	for _, rc := range rcs {
+		b, _ := io.ReadAll(rc)
+		copy(fullContent[offset:], b)
+		offset += int64(len(b))
 	}
-	wg.Wait()
+
+	if offset != size {
+		return nil, fmt.Errorf("combined length of readclosers (%d) does not match size of descriptor (%d)", offset, size)
+	}
 
 	return io.NopCloser(bytes.NewReader(fullContent)), nil
 }
@@ -368,38 +359,21 @@ func (f *artifactFetcher) StoreInParallel(ctx context.Context, blob ocispec.Desc
 
 		go func(i int64, rc io.ReadCloser) {
 			defer wg.Done()
-			lower, upper := getRange(i, blob.Size, f.downloadChunkSize)
-			writeInChunks(file, rc, lower, upper)
+
+			buf, err := io.ReadAll(rc)
+			if err != nil {
+				log.G(ctx).WithField("file", file.Name()).Infof("failed to read chunk %d/%d for file: %v", i, len(rcs), err)
+				return
+			}
+
+			lower, _ := getRange(i, blob.Size, f.downloadChunkSize)
+			_, err = file.WriteAt(buf, lower)
+			if err != nil {
+				log.G(context.Background()).WithField("file", file.Name()).Infof("failed to write chunk %d/%d to file: %v", i, len(rcs), err)
+			}
 		}(int64(i), rc)
 	}
 	wg.Wait()
 
 	return nil
-}
-
-func writeInChunks(file *os.File, rc io.ReadCloser, lower, upper int64) {
-	defer rc.Close()
-
-	chunkSize := upper - lower + 1
-	bufSize := maxBufferSize
-	if chunkSize < bufSize {
-		bufSize = chunkSize
-	}
-
-	var buf []byte
-	n := 1
-	buf = make([]byte, bufSize)
-	for n != 0 {
-		n, err := rc.Read(buf)
-		if n != 0 {
-			file.WriteAt(buf[:n], lower)
-			lower += int64(n)
-		}
-		if err != nil {
-			if err != io.EOF {
-				log.G(context.Background()).WithField("file", file.Name()).Infof("failed to write to file %v: %v", file.Name(), err)
-			}
-			break
-		}
-	}
 }

@@ -524,16 +524,17 @@ func (fs *filesystem) premount(ctx context.Context, unpacker Unpacker, target oc
 	log.G(ctx).WithField("target", target).Debug("premounting")
 
 	base := "/var/lib/soci-snapshotter-grpc/premount"
-	mountpoint := filepath.Join(base, target.Digest.String())
+	mountpoint := filepath.Join(base, digest)
 	os.MkdirAll(mountpoint, 0611)
 	if ok && status.(unpackStatus).err != nil {
 		os.RemoveAll(mountpoint)
+		log.G(ctx).WithField("target", target).Error("had to remove all")
 	}
 	err := unpacker.Unpack(ctx, target, mountpoint, []mount.Mount{})
 	if err != nil {
 		log.G(ctx).WithField("target", target).WithError(err).Error("error unpacking")
 	} else {
-		log.G(ctx).WithField("target", target).WithError(err).Debug("successfully premounted")
+		log.G(ctx).WithField("target", target).Debug("successfully premounted")
 	}
 	status = unpackStatus{
 		unpacked: err == nil,
