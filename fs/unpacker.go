@@ -76,6 +76,7 @@ func NewLayerUnpacker(fetcher Fetcher, archive Archive) Unpacker {
 }
 
 func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mountpoint string, mounts []mount.Mount) error {
+	log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("ctrl f mounts: %v", mounts)
 	start := time.Now().UnixMilli()
 	rcs, local, err := lu.fetcher.Fetch(ctx, desc)
 	if err != nil {
