@@ -436,6 +436,7 @@ type unpackStatus struct {
 	unpacked bool
 	location string
 	err      error
+	hasMoved bool
 }
 
 func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
@@ -504,6 +505,7 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 			unpacked: err == nil,
 			err:      err,
 			location: mountpoint,
+			hasMoved: true,
 		}
 
 		fs.layerUnpackMap.Store(digest, status)
@@ -524,16 +526,21 @@ func (fs *filesystem) tryRebase(ctx context.Context, target ocispec.Descriptor, 
 	fs.layerUnpackMu.Lock(digest)
 	defer fs.layerUnpackMu.Unlock(digest)
 
-	status, ok := fs.layerUnpackMap.Load(digest)
-	if ok && status.(unpackStatus).unpacked {
-		os.RemoveAll(mountpoint)
-		err := os.Rename(status.(unpackStatus).location, mountpoint)
-		if err != nil {
-			log.G(ctx).WithField("target", target).WithError(err).Error("error rebasing")
-		} else {
-			log.G(ctx).WithField("target", target).WithError(err).Debug("successfully rebased")
+	s, ok := fs.layerUnpackMap.Load(digest)
+	if ok {
+		status := s.(unpackStatus)
+		if status.unpacked && !status.hasMoved {
+			os.RemoveAll(mountpoint)
+			err := os.Rename(status.location, mountpoint)
+			if err != nil {
+				log.G(ctx).WithField("target", target).WithError(err).Error("error rebasing")
+			} else {
+				status.hasMoved = true
+				fs.layerUnpackMap.Store(digest, status)
+				log.G(ctx).WithField("target", target).WithError(err).Debug("successfully rebased")
+			}
+			return err != nil
 		}
-		return err != nil
 	}
 	return false
 }
@@ -567,6 +574,7 @@ func (fs *filesystem) premount(ctx context.Context, unpacker Unpacker, target oc
 		unpacked: err == nil,
 		err:      err,
 		location: mountpoint,
+		hasMoved: false,
 	}
 
 	fs.layerUnpackMap.Store(digest, status)
