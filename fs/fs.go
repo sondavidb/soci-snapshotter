@@ -477,17 +477,29 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 		}
 	}
 
+	digest := desc.Digest.String()
 	for _, l := range s.Manifest.Layers {
+		if digest == l.Digest.String() {
+			continue
+		}
+
 		go fs.premount(context.TODO(), unpacker, l)
 	}
 
 	// Wait for unpacker to finish
-	fs.layerUnpackMu.Lock(desc.Digest.String())
-	_, ok = fs.layerUnpackMap.Load(desc.Digest.String())
+	fs.layerUnpackMu.Lock(digest)
+	_, ok = fs.layerUnpackMap.Load(digest)
 	if !ok {
 		err = unpacker.Unpack(ctx, desc, mountpoint, mounts)
+		status := unpackStatus{
+			unpacked: err == nil,
+			err:      err,
+			location: mountpoint,
+		}
+
+		fs.layerUnpackMap.Store(digest, status)
 	}
-	fs.layerUnpackMu.Unlock(desc.Digest.String())
+	fs.layerUnpackMu.Unlock(digest)
 
 	if err != nil {
 		return fmt.Errorf("cannot unpack the layer: %w", err)
