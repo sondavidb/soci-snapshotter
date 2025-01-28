@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/semaphore"
 )
 
 type Unpacker interface {
@@ -36,7 +37,7 @@ type Unpacker interface {
 	// decompressing it, putting it in the directory with the path `mountpoint`
 	// and applying the difference to the parent layers if there is any.
 	// After that the layer can be mounted as non-remote snapshot.
-	Unpack(ctx context.Context, desc ocispec.Descriptor, mountpoint string, mounts []mount.Mount) error
+	Unpack(ctx context.Context, desc ocispec.Descriptor, mountpoint string, mounts []mount.Mount, smp *semaphore.Weighted) error
 }
 
 type Archive interface {
@@ -75,7 +76,7 @@ func NewLayerUnpacker(fetcher Fetcher, archive Archive) Unpacker {
 	}
 }
 
-func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mountpoint string, mounts []mount.Mount) error {
+func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mountpoint string, mounts []mount.Mount, smp *semaphore.Weighted) error {
 	start := time.Now().UnixMilli()
 	rcs, local, err := lu.fetcher.Fetch(ctx, desc)
 	if err != nil {

@@ -272,6 +272,13 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 	pr := newPreresolver(fsOpts.maxConcurrency)
 	pr.Start(ctx)
 
+	// Use the same limiter on network pulls as you do on layer unpacking.
+	// TODO: Consider separating out
+	smpSize := fsOpts.maxPullConcurrency
+	if smpSize <= 0 {
+		smpSize = 1
+	}
+
 	var ns *metrics.Namespace
 	if !cfg.NoPrometheus {
 		ns = metrics.NewNamespace("soci", "fs", nil)
@@ -312,6 +319,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		downloadChunkSize:           fsOpts.downloadChunkSize,
 		layerUnpackMap:              &sync.Map{},
 		layerUnpackMu:               &namedmutex.NamedMutex{},
+		layerUnpackSmp:              semaphore.NewWeighted(smpSize),
 	}, nil
 }
 
@@ -421,6 +429,7 @@ type filesystem struct {
 
 	layerUnpackMu  *namedmutex.NamedMutex
 	layerUnpackMap *sync.Map
+	layerUnpackSmp *semaphore.Weighted
 }
 
 type unpackStatus struct {
@@ -490,7 +499,7 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	fs.layerUnpackMu.Lock(digest)
 	_, ok = fs.layerUnpackMap.Load(digest)
 	if !ok {
-		err = unpacker.Unpack(ctx, desc, mountpoint, mounts)
+		err = unpacker.Unpack(ctx, desc, mountpoint, mounts, fs.layerUnpackSmp)
 		status := unpackStatus{
 			unpacked: err == nil,
 			err:      err,
@@ -548,7 +557,7 @@ func (fs *filesystem) premount(ctx context.Context, unpacker Unpacker, target oc
 		os.RemoveAll(mountpoint)
 		log.G(ctx).WithField("target", target).Error("had to remove all")
 	}
-	err := unpacker.Unpack(ctx, target, mountpoint, []mount.Mount{})
+	err := unpacker.Unpack(ctx, target, mountpoint, []mount.Mount{}, fs.layerUnpackSmp)
 	if err != nil {
 		log.G(ctx).WithField("target", target).WithError(err).Error("error unpacking")
 	} else {
