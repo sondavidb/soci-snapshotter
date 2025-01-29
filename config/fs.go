@@ -62,6 +62,8 @@ type FSConfig struct {
 	// DownloadChunkSize determines the maximum size of download requests when download tarballs.
 	// If set to be a negative number, layers will be downloaded in a singular request per layer.
 	DownloadChunkSize int64 `toml:"download_chunk_size"`
+	// MaxUnpackConcurrency determines the max number of layers that will be unpacked in parallel
+	MaxUnpackConcurrency int64 `toml:"max_unpack_concurrency"`
 
 	RetryableHTTPClientConfig `toml:"http"`
 	BlobConfig                `toml:"blob"`
@@ -201,6 +203,12 @@ func parseFSConfig(cfg *Config) {
 	}
 	if cfg.DownloadChunkSize < 0 {
 		cfg.DownloadChunkSize = 0
+	}
+	if cfg.MaxUnpackConcurrency == 0 {
+		cfg.MaxUnpackConcurrency = int64(runtime.NumCPU())
+	}
+	if cfg.MaxUnpackConcurrency < 0 {
+		cfg.MaxUnpackConcurrency = 1
 	}
 
 	if cfg.MaxConcurrency == 0 {

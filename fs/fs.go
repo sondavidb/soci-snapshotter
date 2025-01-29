@@ -152,13 +152,14 @@ func (pr *preresolver) Enqueue(imgNameAndDigest string, fn func(context.Context)
 type Option func(*options)
 
 type options struct {
-	getSources         source.GetSources
-	resolveHandlers    map[string]remote.Handler
-	metadataStore      metadata.Store
-	overlayOpaqueType  layer.OverlayOpaqueType
-	maxConcurrency     int64
-	maxPullConcurrency int64
-	downloadChunkSize  int64
+	getSources           source.GetSources
+	resolveHandlers      map[string]remote.Handler
+	metadataStore        metadata.Store
+	overlayOpaqueType    layer.OverlayOpaqueType
+	maxConcurrency       int64
+	maxPullConcurrency   int64
+	downloadChunkSize    int64
+	maxUnpackConcurrency int64
 }
 
 func WithGetSources(s source.GetSources) Option {
@@ -203,6 +204,12 @@ func WithMaxPullConcurrency(maxPullConcurrency int64) Option {
 func WithDownloadChunkSize(downloadChunkSize int64) Option {
 	return func(opts *options) {
 		opts.downloadChunkSize = downloadChunkSize
+	}
+}
+
+func WithMaxUnpackConcurrency(maxUnpackConcurrency int64) Option {
+	return func(opts *options) {
+		opts.maxUnpackConcurrency = maxUnpackConcurrency
 	}
 }
 
@@ -272,13 +279,6 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 	pr := newPreresolver(fsOpts.maxConcurrency)
 	pr.Start(ctx)
 
-	// Use the same limiter on network pulls as you do on layer unpacking.
-	// TODO: Consider separating out
-	smpSize := fsOpts.maxPullConcurrency
-	if smpSize <= 0 {
-		smpSize = 1
-	}
-
 	var ns *metrics.Namespace
 	if !cfg.NoPrometheus {
 		ns = metrics.NewNamespace("soci", "fs", nil)
@@ -319,7 +319,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		downloadChunkSize:           fsOpts.downloadChunkSize,
 		layerUnpackMap:              &sync.Map{},
 		layerUnpackMu:               &namedmutex.NamedMutex{},
-		layerUnpackSmp:              semaphore.NewWeighted(smpSize),
+		layerUnpackSmp:              semaphore.NewWeighted(fsOpts.maxUnpackConcurrency),
 	}, nil
 }
 

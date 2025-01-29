@@ -111,6 +111,9 @@ func NewSociSnapshotterService(ctx context.Context, root string, serviceCfg *con
 	if serviceCfg.FSConfig.DownloadChunkSize != 0 {
 		fsOpts = append(fsOpts, socifs.WithDownloadChunkSize(serviceCfg.FSConfig.DownloadChunkSize))
 	}
+	if serviceCfg.FSConfig.MaxUnpackConcurrency != 0 {
+		fsOpts = append(fsOpts, socifs.WithMaxUnpackConcurrency(serviceCfg.FSConfig.MaxUnpackConcurrency))
+	}
 
 	fs, err := socifs.NewFilesystem(ctx, fsRoot(root), serviceCfg.FSConfig, fsOpts...)
 	if err != nil {
