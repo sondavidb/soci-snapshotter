@@ -123,6 +123,8 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 		opts = append(opts, archive.WithParents(parents))
 	}
 
+	smp.Acquire(ctx, 1)
+	defer smp.Release(1)
 	_, err = lu.archive.Apply(ctx, mountpoint, rc, opts...)
 	if err != nil {
 		return fmt.Errorf("cannot apply layer: %w", err)

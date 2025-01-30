@@ -488,6 +488,26 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	}
 
 	digest := desc.Digest.String()
+
+	fs.layerUnpackMu.Lock(digest)
+	wg := new(sync.WaitGroup)
+	_, ok = fs.layerUnpackMap.Load(digest)
+	if !ok {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			err = unpacker.Unpack(ctx, desc, mountpoint, mounts, fs.layerUnpackSmp)
+			status := unpackStatus{
+				unpacked: err == nil,
+				err:      err,
+				location: mountpoint,
+				hasMoved: true,
+			}
+			fs.layerUnpackMap.Store(digest, status)
+		}()
+	}
+
 	for _, l := range s.Manifest.Layers {
 		if digest == l.Digest.String() {
 			continue
@@ -496,20 +516,8 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 		go fs.premount(context.TODO(), unpacker, l)
 	}
 
-	// Wait for unpacker to finish
-	fs.layerUnpackMu.Lock(digest)
-	_, ok = fs.layerUnpackMap.Load(digest)
-	if !ok {
-		err = unpacker.Unpack(ctx, desc, mountpoint, mounts, fs.layerUnpackSmp)
-		status := unpackStatus{
-			unpacked: err == nil,
-			err:      err,
-			location: mountpoint,
-			hasMoved: true,
-		}
-
-		fs.layerUnpackMap.Store(digest, status)
-	}
+	// Wait for this layer to finish unpacking to return the mountpoint
+	wg.Wait()
 	fs.layerUnpackMu.Unlock(digest)
 
 	if err != nil {
