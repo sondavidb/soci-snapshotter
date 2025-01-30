@@ -27,7 +27,6 @@ import (
 	"github.com/containerd/containerd/archive/compression"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/log"
-	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/semaphore"
 )
@@ -107,8 +106,8 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	}
 	defer rc.Close()
 
-	digester := digest.Canonical.Digester()
-	rc = io.NopCloser(io.TeeReader(rc, digester.Hash()))
+	verifier := desc.Digest.Verifier()
+	rc = io.NopCloser(io.TeeReader(rc, verifier))
 
 	var parents []string
 	if len(mounts) > 0 {
@@ -129,8 +128,7 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 		return fmt.Errorf("cannot apply layer: %w", err)
 	}
 
-	digest := digester.Digest()
-	if digest != desc.Digest {
+	if !verifier.Verified() {
 		return fmt.Errorf("digests did not match")
 	} else {
 		log.G(ctx).Debug("good digest")
