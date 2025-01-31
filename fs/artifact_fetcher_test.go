@@ -86,7 +86,6 @@ func TestArtifactFetcherFetch(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			fetcher, err := newFakeArtifactFetcher(imageRef, tc.contents)
-			fetcher.maxPullConcurrency = 1
 			if err != nil {
 				t.Fatalf("could not create artifact fetcher: %v", err)
 			}
@@ -262,7 +261,7 @@ func newFakeArtifactFetcher(ref string, contents []byte) (*artifactFetcher, erro
 	if err != nil {
 		return nil, err
 	}
-	return newArtifactFetcher(refspec, memory.New(), newFakeRemoteStore(contents), 0, 0)
+	return newArtifactFetcher(refspec, memory.New(), newFakeRemoteStore(contents), 0, nil)
 }
 
 func newFakeRemoteStore(contents []byte) resolverStorage {

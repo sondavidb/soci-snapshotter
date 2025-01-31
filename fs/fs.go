@@ -293,6 +293,8 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 
 	go commonmetrics.ListenForFuseFailure(ctx)
 
+	log.G(context.Background()).Debugf("num concurrent processes: %d, chunk size: %d", fsOpts.maxPullConcurrency, fsOpts.downloadChunkSize)
+
 	return &filesystem{
 		// it's generally considered bad practice to store a context in a struct,
 		// however `filesystem` has it's own lifecycle as well as a per-request lifecycle.
@@ -321,6 +323,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		downloadChunkSize:           fsOpts.downloadChunkSize,
 		layerUnpackMap:              &sync.Map{},
 		layerUnpackMu:               &namedmutex.NamedMutex{},
+		layerPullSmp:                semaphore.NewWeighted(fsOpts.maxPullConcurrency),
 		layerUnpackSmp:              semaphore.NewWeighted(fsOpts.maxUnpackConcurrency),
 		manifests:                   new(manifestMap),
 	}, nil
@@ -336,7 +339,7 @@ type sociContext struct {
 	fuseOperationCounter *layer.FuseOperationCounter
 }
 
-func (c *sociContext) Init(fsCtx context.Context, ctx context.Context, imageRef, indexDigest, imageManifestDigest string, store store.Store, fuseOpEmitWaitDuration time.Duration, client *http.Client, maxPullConcurrency, downloadChunkSize int64) error {
+func (c *sociContext) Init(fsCtx context.Context, ctx context.Context, imageRef, indexDigest, imageManifestDigest string, store store.Store, fuseOpEmitWaitDuration time.Duration, client *http.Client, downloadChunkSize int64, layerPullSmp *semaphore.Weighted) error {
 	var retErr error
 	c.fetchOnce.Do(func() {
 		defer func() {
@@ -381,7 +384,7 @@ func (c *sociContext) Init(fsCtx context.Context, ctx context.Context, imageRef,
 
 		log.G(ctx).WithField("digest", indexDesc.Digest.String()).Infof("fetching SOCI artifacts using index descriptor")
 
-		index, err := FetchSociArtifacts(fsCtx, refspec, indexDesc, store, remoteStore, maxPullConcurrency, downloadChunkSize)
+		index, err := FetchSociArtifacts(fsCtx, refspec, indexDesc, store, remoteStore, downloadChunkSize, layerPullSmp)
 		if err != nil {
 			retErr = fmt.Errorf("%w: error trying to fetch SOCI artifacts: %w", snapshot.ErrNoIndex, err)
 			return
@@ -452,6 +455,8 @@ type filesystem struct {
 
 	layerUnpackMu  *namedmutex.NamedMutex
 	layerUnpackMap *sync.Map
+
+	layerPullSmp   *semaphore.Weighted
 	layerUnpackSmp *semaphore.Weighted
 
 	manifests *manifestMap
@@ -488,7 +493,7 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	if err != nil {
 		return fmt.Errorf("cannot create remote store: %w", err)
 	}
-	fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore, fs.maxPullConcurrency, fs.downloadChunkSize)
+	fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore, fs.downloadChunkSize, fs.layerPullSmp)
 	if err != nil {
 		return fmt.Errorf("cannot create fetcher: %w", err)
 	}
@@ -680,7 +685,7 @@ func (fs *filesystem) getSociContext(ctx context.Context, imageRef, indexDigest,
 	if !ok {
 		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", indexDigest)
 	}
-	err := c.Init(fs.ctx, ctx, imageRef, indexDigest, imageManifestDigest, fs.contentStore, fs.fuseMetricsEmitWaitDuration, client, fs.maxPullConcurrency, fs.downloadChunkSize)
+	err := c.Init(fs.ctx, ctx, imageRef, indexDigest, imageManifestDigest, fs.contentStore, fs.fuseMetricsEmitWaitDuration, client, fs.downloadChunkSize, fs.layerPullSmp)
 	return c, err
 }
 

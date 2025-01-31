@@ -69,17 +69,13 @@ type artifactFetcher struct {
 
 // Constructs a new artifact fetcher
 // Takes in the image reference, the local store and the resolver
-func newArtifactFetcher(refspec reference.Spec, localStore store.BasicStore, remoteStore resolverStorage, maxPullConcurrency, downloadChunkSize int64) (*artifactFetcher, error) {
-	log.G(context.Background()).Debugf("num concurrent processes: %d, chunk size: %d", maxPullConcurrency, downloadChunkSize)
-	// maxPullConcurrency is always >=1 so we can always do this
-	smp := semaphore.NewWeighted(maxPullConcurrency)
+func newArtifactFetcher(refspec reference.Spec, localStore store.BasicStore, remoteStore resolverStorage, downloadChunkSize int64, smp *semaphore.Weighted) (*artifactFetcher, error) {
 	return &artifactFetcher{
-		localStore:         localStore,
-		remoteStore:        remoteStore,
-		refspec:            refspec,
-		maxPullConcurrency: maxPullConcurrency,
-		downloadChunkSize:  downloadChunkSize,
-		smp:                smp,
+		localStore:        localStore,
+		remoteStore:       remoteStore,
+		refspec:           refspec,
+		downloadChunkSize: downloadChunkSize,
+		smp:               smp,
 	}, nil
 }
 
@@ -145,6 +141,9 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 	log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("layer size: %d", desc.Size)
 	// Pull at once if doesn't hit concurrency requirement
 	if desc.Size <= f.downloadChunkSize || f.downloadChunkSize <= 0 {
+		f.smp.Acquire(ctx, 1)
+		defer f.smp.Release(1)
+
 		if desc.Size <= f.downloadChunkSize {
 			log.G(ctx).Debugf("layer size (%d) smaller than download chunk size, pulling all at once", desc.Size)
 		} else {
@@ -252,8 +251,8 @@ func combineReadClosers(rcs []io.ReadCloser, size int64) (io.ReadCloser, error) 
 	return io.NopCloser(bytes.NewReader(fullContent)), nil
 }
 
-func FetchSociArtifacts(ctx context.Context, refspec reference.Spec, indexDesc ocispec.Descriptor, localStore store.Store, remoteStore resolverStorage, maxPullConcurrency, downloadChunkSize int64) (*soci.Index, error) {
-	fetcher, err := newArtifactFetcher(refspec, localStore, remoteStore, maxPullConcurrency, downloadChunkSize)
+func FetchSociArtifacts(ctx context.Context, refspec reference.Spec, indexDesc ocispec.Descriptor, localStore store.Store, remoteStore resolverStorage, downloadChunkSize int64, layerPullSmp *semaphore.Weighted) (*soci.Index, error) {
+	fetcher, err := newArtifactFetcher(refspec, localStore, remoteStore, downloadChunkSize, layerPullSmp)
 	if err != nil {
 		return nil, fmt.Errorf("could not create an artifact fetcher: %w", err)
 	}
