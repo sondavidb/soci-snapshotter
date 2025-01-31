@@ -44,6 +44,7 @@ package fs
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	golog "log"
@@ -82,6 +83,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
+	ociremote "oras.land/oras-go/v2/registry/remote"
 )
 
 var (
@@ -320,6 +322,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		layerUnpackMap:              &sync.Map{},
 		layerUnpackMu:               &namedmutex.NamedMutex{},
 		layerUnpackSmp:              semaphore.NewWeighted(fsOpts.maxUnpackConcurrency),
+		manifests:                   new(manifestMap),
 	}, nil
 }
 
@@ -405,6 +408,26 @@ func (c *sociContext) populateImageLayerToSociMapping(sociIndex *soci.Index) {
 	}
 }
 
+// manifestMap is a wrapper for an atomic map
+// of a manifest digest to its appropriate config
+// key — manifest digest
+// value — map of digest to config
+type manifestMap struct {
+	m sync.Map
+}
+
+func (m *manifestMap) Store(key string, value map[string]digest.Digest) {
+	m.m.Store(key, value)
+}
+
+func (m *manifestMap) Load(key string) (map[string]digest.Digest, bool) {
+	value, ok := m.m.Load(key)
+	if ok {
+		return value.(map[string]digest.Digest), ok
+	}
+	return map[string]digest.Digest{}, false
+}
+
 type filesystem struct {
 	ctx                         context.Context
 	resolver                    *layer.Resolver
@@ -430,6 +453,8 @@ type filesystem struct {
 	layerUnpackMu  *namedmutex.NamedMutex
 	layerUnpackMap *sync.Map
 	layerUnpackSmp *semaphore.Weighted
+
+	manifests *manifestMap
 }
 
 type unpackStatus struct {
@@ -467,8 +492,14 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	if err != nil {
 		return fmt.Errorf("cannot create fetcher: %w", err)
 	}
-	unpacker := NewLayerUnpacker(fetcher, archive)
+
 	desc := s.Target
+	diffIDMap, err := fs.getLayerDiffMap(ctx, labels, remoteStore, fetcher)
+	if err != nil {
+		return fmt.Errorf("error getting layer diff ID: %v", err)
+	}
+
+	unpacker := NewLayerUnpacker(fetcher, archive, diffIDMap)
 
 	if fs.tryRebase(ctx, desc, mountpoint) {
 		return nil
@@ -525,6 +556,60 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	}
 
 	return nil
+}
+
+func (fs *filesystem) getLayerDiffMap(ctx context.Context, labels map[string]string, remoteStore *ociremote.Repository, fetcher *artifactFetcher) (map[string]digest.Digest, error) {
+	manDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
+	if !ok {
+		return nil, fmt.Errorf("no manifest label attached to image")
+	}
+
+	diffIDMap, ok := fs.manifests.Load(manDigest)
+	if !ok {
+		manifestReq, err := fetcher.resolve(ctx, ocispec.Descriptor{Digest: digest.Digest(manDigest)})
+		if err != nil {
+			return nil, fmt.Errorf("error resolving manifest: %v", err)
+		}
+		rc, err := remoteStore.Fetch(ctx, manifestReq, 0, 0)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching manifest from upstream: %v", err)
+		}
+
+		b, _ := io.ReadAll(rc)
+		manifest := ocispec.Manifest{}
+		err = json.Unmarshal(b, &manifest)
+		if err != nil {
+			return nil, fmt.Errorf("error unmarshalling manifest JSON: %v", err)
+		}
+		rc, err = remoteStore.Fetch(ctx, manifest.Config, 0, 0)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching manifest config from upstream: %v", err)
+		}
+
+		b, _ = io.ReadAll(rc)
+		imgConfig := ocispec.Image{}
+
+		err = json.Unmarshal(b, &imgConfig)
+		if err != nil {
+			return nil, fmt.Errorf("error unmarshalling image config JSON: %v", err)
+		}
+
+		diffIDShas := imgConfig.RootFS.DiffIDs
+		compressedShas := manifest.Layers
+		if len(diffIDShas) != len(compressedShas) {
+			return nil, fmt.Errorf("mismatch between manifest layers and diff IDs")
+		}
+
+		for i := range len(diffIDShas) {
+			diffIDMap[compressedShas[i].Digest.String()] = diffIDShas[i]
+		}
+
+		fs.manifests.Store(manDigest, diffIDMap)
+	}
+	log.G(ctx).Debugf("successfully fetched config: %+v", diffIDMap)
+
+	return diffIDMap, nil
+
 }
 
 // true means that rebase was successful, we can skip unpacking

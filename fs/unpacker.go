@@ -27,6 +27,7 @@ import (
 	"github.com/containerd/containerd/archive/compression"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/log"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/semaphore"
 )
@@ -42,7 +43,7 @@ type Unpacker interface {
 type Archive interface {
 	// Apply decompresses the compressed stream represented by reader `r` and
 	// applies it to the directory `root`.
-	Apply(ctx context.Context, root string, r io.Reader, opts ...archive.ApplyOpt) (int64, error)
+	Apply(ctx context.Context, root string, r io.Reader, compressed, uncompressed digest.Digest, opts ...archive.ApplyOpt) (int64, error)
 }
 
 type layerArchive struct {
@@ -52,26 +53,43 @@ func NewLayerArchive() Archive {
 	return &layerArchive{}
 }
 
-func (la *layerArchive) Apply(ctx context.Context, root string, r io.Reader, opts ...archive.ApplyOpt) (int64, error) {
+func (la *layerArchive) Apply(ctx context.Context, root string, r io.Reader, compressed, uncompressed digest.Digest, opts ...archive.ApplyOpt) (int64, error) {
 	// we use containerd implementation here
 	// decompress first and then apply
-	decompressReader, err := compression.DecompressStream(r)
+	compVerifier := compressed.Verifier()
+	decompressReader, err := compression.DecompressStream(io.TeeReader(r, compVerifier))
 	if err != nil {
 		return 0, fmt.Errorf("cannot decompress the stream: %w", err)
 	}
 	defer decompressReader.Close()
-	return archive.Apply(ctx, root, decompressReader, opts...)
+
+	uncompVerifier := uncompressed.Verifier()
+	n, err := archive.Apply(ctx, root, io.TeeReader(decompressReader, uncompVerifier), opts...)
+	if err != nil {
+		return 0, err
+	}
+
+	if !compVerifier.Verified() {
+		return 0, fmt.Errorf("compressed digests did not match")
+	}
+	if !uncompVerifier.Verified() {
+		return 0, fmt.Errorf("uncompressed digests did not match")
+	}
+
+	return n, nil
 }
 
 type layerUnpacker struct {
-	fetcher Fetcher
-	archive Archive
+	fetcher   Fetcher
+	archive   Archive
+	diffIDMap map[string]digest.Digest
 }
 
-func NewLayerUnpacker(fetcher Fetcher, archive Archive) Unpacker {
+func NewLayerUnpacker(fetcher Fetcher, archive Archive, diffIDMap map[string]digest.Digest) Unpacker {
 	return &layerUnpacker{
-		fetcher: fetcher,
-		archive: archive,
+		fetcher:   fetcher,
+		archive:   archive,
+		diffIDMap: diffIDMap,
 	}
 }
 
@@ -106,9 +124,6 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	}
 	defer rc.Close()
 
-	verifier := desc.Digest.Verifier()
-	rc = io.NopCloser(io.TeeReader(rc, verifier))
-
 	var parents []string
 	if len(mounts) > 0 {
 		parents, err = getLayerParents(mounts[0].Options)
@@ -123,18 +138,19 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 		opts = append(opts, archive.WithParents(parents))
 	}
 
+	uncompressedDigest, ok := lu.diffIDMap[desc.Digest.String()]
+	if !ok {
+		return fmt.Errorf("error getting diff ID of layer")
+	}
+
 	smp.Acquire(ctx, 1)
 	defer smp.Release(1)
-	_, err = lu.archive.Apply(ctx, mountpoint, rc, opts...)
+	compressedDigest := desc.Digest
+	_, err = lu.archive.Apply(ctx, mountpoint, rc, compressedDigest, uncompressedDigest, opts...)
 	if err != nil {
 		return fmt.Errorf("cannot apply layer: %w", err)
 	}
-
-	if !verifier.Verified() {
-		return fmt.Errorf("digests did not match")
-	} else {
-		log.G(ctx).Debug("good digest")
-	}
+	log.G(ctx).Debug("good digests")
 
 	return nil
 }
