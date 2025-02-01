@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/awslabs/soci-snapshotter/soci"
 	"github.com/awslabs/soci-snapshotter/soci/store"
@@ -141,9 +142,6 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 	log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("layer size: %d", desc.Size)
 	// Pull at once if doesn't hit concurrency requirement
 	if desc.Size <= f.downloadChunkSize || f.downloadChunkSize <= 0 {
-		f.smp.Acquire(ctx, 1)
-		defer f.smp.Release(1)
-
 		if desc.Size <= f.downloadChunkSize {
 			log.G(ctx).Debugf("layer size (%d) smaller than download chunk size, pulling all at once", desc.Size)
 		} else {
@@ -155,7 +153,6 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 		}
 		rcs = []io.ReadCloser{rc}
 	} else {
-
 		wg := new(sync.WaitGroup)
 		var hasErr atomic.Bool
 
@@ -165,12 +162,11 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 		log.G(ctx).Debugf("pulling concurrently %d bytes in %d loops", desc.Size, numLoops)
 		for i := range numLoops {
 			wg.Add(1)
-			f.smp.Acquire(ctx, 1)
 
 			go func(i int64) {
 				defer wg.Done()
-				defer f.smp.Release(1)
 
+				start := time.Now().UnixMilli()
 				lower, upper := getRange(i, desc.Size, f.downloadChunkSize)
 				log.G(ctx).WithField("digest", desc.Digest.String()).Debugf("layer lower: %d upper: %v", lower, upper)
 				rc, err := f.remoteStore.Fetch(ctx, desc, lower, upper)
@@ -179,6 +175,8 @@ func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) ([
 					hasErr.Store(true)
 					return
 				}
+
+				log.G(ctx).Debugf("made network call in %d ms", time.Now().UnixMilli()-start)
 
 				// Maintain order of fetched bytes
 				rcs[i] = rc
@@ -353,23 +351,30 @@ func (f *artifactFetcher) StoreInParallel(ctx context.Context, blob ocispec.Desc
 
 	wg := new(sync.WaitGroup)
 	for i, rc := range rcs {
+		f.smp.Acquire(ctx, 1)
 		rc := rc
 		wg.Add(1)
 
 		go func(i int64, rc io.ReadCloser) {
 			defer wg.Done()
+			defer f.smp.Release(1)
+			defer rc.Close()
 
+			start := time.Now().UnixMilli()
 			buf, err := io.ReadAll(rc)
 			if err != nil {
 				log.G(ctx).WithField("file", file.Name()).Infof("failed to read chunk %d/%d for file: %v", i, len(rcs), err)
 				return
 			}
+			log.G(ctx).Debugf("finished reading from network in %d ms with buffer size %d", time.Now().UnixMilli()-start, len(buf))
 
 			lower, _ := getRange(i, blob.Size, f.downloadChunkSize)
+			start = time.Now().UnixMilli()
 			_, err = file.WriteAt(buf, lower)
 			if err != nil {
 				log.G(context.Background()).WithField("file", file.Name()).Infof("failed to write chunk %d/%d to file: %v", i, len(rcs), err)
 			}
+			log.G(ctx).Debugf("unpacked chunk in %d ms", time.Now().UnixMilli()-start)
 		}(int64(i), rc)
 	}
 	wg.Wait()
