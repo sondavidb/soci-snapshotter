@@ -178,9 +178,13 @@ func (s *SociStore) Label(_ context.Context, _ ocispec.Descriptor, _ string, _ s
 	return nil
 }
 
-// Delete is a no-op for sociStore until oci.Store provides this method.
-func (s *SociStore) Delete(_ context.Context, _ digest.Digest) error {
-	return nil
+// Delete removes the described content.
+func (s *SociStore) Delete(ctx context.Context, d digest.Digest) error {
+	desc, err := s.Resolve(ctx, d.String())
+	if err != nil {
+		return err
+	}
+	return s.Store.Delete(ctx, desc)
 }
 
 // BatchOpen is a no-op for sociStore; it does not support batching operations.
