@@ -630,6 +630,7 @@ func TestRunWithIdMap(t *testing.T) {
 				},
 			},
 		},
+
 		{
 			name: "with multiple substitutions",
 			// This version of ubuntu has a default "ubuntu" user, so we can use that
