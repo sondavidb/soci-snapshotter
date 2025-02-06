@@ -65,6 +65,7 @@ func TestMain(m *testing.M) {
 	}
 
 	if logLevel := os.Getenv(containerdLogLevelEnv); logLevel != "" {
+
 		if _, err := logrus.ParseLevel(logLevel); err != nil {
 			testutil.TestingL.Printf("unsupported log level: %s. skipping integration test", logLevel)
 			return
