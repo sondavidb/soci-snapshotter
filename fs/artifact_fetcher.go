@@ -45,6 +45,7 @@ type Fetcher interface {
 	Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, bool, error)
 	// Store takes in a descriptor and io.Reader and stores it in the local store.
 	Store(ctx context.Context, desc ocispec.Descriptor, reader io.Reader) error
+	WriteTemp(ctx context.Context, expected ocispec.Descriptor, reader io.Reader) (store.CleanupFunc, error)
 }
 type resolverStorage interface {
 	content.Resolver
@@ -54,13 +55,13 @@ type resolverStorage interface {
 // artifactFetcher is responsible for fetching and storing artifacts in the provided artifact store.
 type artifactFetcher struct {
 	remoteStore resolverStorage
-	localStore  store.BasicStore
+	localStore  store.Store
 	refspec     reference.Spec
 }
 
 // Constructs a new artifact fetcher
 // Takes in the image reference, the local store and the resolver
-func newArtifactFetcher(refspec reference.Spec, localStore store.BasicStore, remoteStore resolverStorage) (*artifactFetcher, error) {
+func newArtifactFetcher(refspec reference.Spec, localStore store.Store, remoteStore resolverStorage) (*artifactFetcher, error) {
 	return &artifactFetcher{
 		localStore:  localStore,
 		remoteStore: remoteStore,
@@ -136,6 +137,10 @@ func (f *artifactFetcher) Store(ctx context.Context, desc ocispec.Descriptor, re
 		return fmt.Errorf("unable to push to local store: %w", err)
 	}
 	return nil
+}
+
+func (f *artifactFetcher) WriteTemp(ctx context.Context, expected ocispec.Descriptor, r io.Reader) (store.CleanupFunc, error) {
+	return f.localStore.WriteTemp(ctx, expected, r)
 }
 
 func FetchSociArtifacts(ctx context.Context, refspec reference.Spec, indexDesc ocispec.Descriptor, localStore store.Store, remoteStore resolverStorage) (*soci.Index, error) {

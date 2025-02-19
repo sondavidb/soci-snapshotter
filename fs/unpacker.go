@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/containerd/containerd/archive"
 	"github.com/containerd/containerd/archive/compression"
@@ -78,18 +79,6 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 		return fmt.Errorf("cannot fetch layer: %w", err)
 	}
 
-	if !local {
-		err := lu.fetcher.Store(ctx, desc, rc)
-		rc.Close()
-		if err != nil {
-			return fmt.Errorf("cannot store layer: %w", err)
-		}
-		rc, _, err = lu.fetcher.Fetch(ctx, desc)
-		if err != nil {
-			return fmt.Errorf("cannot fetch layer: %w", err)
-		}
-	}
-	defer rc.Close()
 	parents, err := getLayerParents(mounts[0].Options)
 	if err != nil {
 		return fmt.Errorf("cannot get layer parents: %w", err)
@@ -100,9 +89,42 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	if len(parents) > 0 {
 		opts = append(opts, archive.WithParents(parents))
 	}
+
+	wg := new(sync.WaitGroup)
+	var goErr error
+	if !local {
+		cleanup, err := lu.fetcher.WriteTemp(ctx, desc, rc)
+		if cleanup != nil {
+			defer cleanup(ctx)
+		}
+		if err != nil {
+			return err
+		}
+
+		wg.Add(1)
+		go func(rc io.ReadCloser) {
+			defer rc.Close()
+			defer wg.Done()
+
+			err := lu.fetcher.Store(ctx, desc, rc)
+			if err != nil {
+				goErr = fmt.Errorf("cannot store layer: %w", err)
+			}
+		}(rc)
+		rc, _, err = lu.fetcher.Fetch(ctx, desc)
+		if err != nil {
+			return fmt.Errorf("cannot fetch layer: %w", err)
+		}
+	}
+	defer rc.Close()
 	_, err = lu.archive.Apply(ctx, mountpoint, rc, opts...)
 	if err != nil {
 		return fmt.Errorf("cannot apply layer: %w", err)
+	}
+
+	wg.Wait()
+	if goErr != nil {
+		return fmt.Errorf("cannot store layer: %v", goErr)
 	}
 
 	return nil

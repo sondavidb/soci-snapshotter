@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/awslabs/soci-snapshotter/config"
@@ -52,6 +54,7 @@ type Store interface {
 	// It returns a cleanup function that ends the batch, which should be called after
 	// all associated content operations are finished.
 	BatchOpen(ctx context.Context) (context.Context, CleanupFunc, error)
+	WriteTemp(ctx context.Context, expected ocispec.Descriptor, reader io.Reader) (CleanupFunc, error)
 }
 
 type ContentStoreType = config.ContentStoreType
@@ -72,6 +75,8 @@ const (
 
 	// Default path to soci content addressable storage
 	DefaultSociContentStorePath = "/var/lib/soci-snapshotter-grpc/content"
+
+	DefaultIngestPath = "/var/lib/soci-snapshotter-grpc/ingests"
 )
 
 func NewStoreConfig(opts ...Option) config.ContentStoreConfig {
@@ -188,6 +193,10 @@ func (s *SociStore) BatchOpen(ctx context.Context) (context.Context, CleanupFunc
 	return ctx, NopCleanup, nil
 }
 
+func (s *SociStore) WriteTemp(ctx context.Context, expected ocispec.Descriptor, reader io.Reader) (CleanupFunc, error) {
+	return nil, fmt.Errorf("SOCI store does not support Write operation")
+}
+
 type ContainerdStore struct {
 	config.ContentStoreConfig
 	client *containerd.Client
@@ -243,9 +252,41 @@ func (s *ContainerdStore) Fetch(ctx context.Context, target ocispec.Descriptor) 
 	return sectionReaderAt{ra, io.NewSectionReader(ra, 0, ra.Size())}, nil
 }
 
+func getIngestLocation(dgst string) string {
+	return filepath.Join(DefaultIngestPath, dgst)
+}
+
+func (s *ContainerdStore) WriteTemp(ctx context.Context, target ocispec.Descriptor, reader io.Reader) (CleanupFunc, error) {
+	err := os.MkdirAll(DefaultIngestPath, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	loc := getIngestLocation(target.Digest.String())
+	f, err := os.Create(loc)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = f.Write(b)
+	c := func(ctx context.Context) error {
+		return os.Remove(loc)
+	}
+	if err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
 // Push pushes the content, matching the expected descriptor.
 // This should be done within a Batch and followed by Label calls to prevent garbage collection.
-func (s *ContainerdStore) Push(ctx context.Context, expected ocispec.Descriptor, reader io.Reader) error {
+func (s *ContainerdStore) Push(ctx context.Context, expected ocispec.Descriptor, _ io.Reader) error {
 	ctx = namespaces.WithNamespace(ctx, s.Namespace)
 	exists, err := s.Exists(ctx, expected)
 	if err != nil {
@@ -267,8 +308,14 @@ func (s *ContainerdStore) Push(ctx context.Context, expected ocispec.Descriptor,
 	}
 	defer writer.Close()
 
+	f, err := os.Open(getIngestLocation(expected.Digest.String()))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
 	for {
-		n, err := reader.Read(buf)
+		n, err := f.Read(buf)
 		if n > 0 {
 			written, err := writer.Write(buf[:n])
 			if err != nil {
