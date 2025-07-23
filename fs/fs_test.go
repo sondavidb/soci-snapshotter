@@ -47,6 +47,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/fs/remote"
 	"github.com/awslabs/soci-snapshotter/fs/source"
 	"github.com/awslabs/soci-snapshotter/idtools"
+	"github.com/awslabs/soci-snapshotter/snapshot"
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes/docker"
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -55,8 +56,9 @@ import (
 )
 
 func TestCheck(t *testing.T) {
+
 	bl := &breakableLayer{}
-	fs := &filesystem{
+	remoteFs := &remoteFS{
 		layer: map[string]layer.Layer{
 			"test": bl,
 		},
@@ -64,15 +66,26 @@ func TestCheck(t *testing.T) {
 			return docker.ConfigureDefaultRegistries(docker.WithPlainHTTP(docker.MatchLocalhost))(imgRefSpec.Hostname())
 		}),
 	}
-	bl.success = true
-	if err := fs.Check(context.TODO(), "test", nil); err != nil {
-		t.Errorf("connection failed; wanted to succeed: %v", err)
+	localFs := &localFS{}
+	parallelFs := &parallelFS{}
+	filesystems := []snapshot.FileSystem{remoteFs, localFs, parallelFs}
+
+	for _, fs := range filesystems {
+		// remoteFS should succeed; rest should fail
+		bl.success = true
+		if err := remoteFs.Check(context.TODO(), "test", nil); err != nil && fs.Type() == snapshot.RemoteFS {
+			t.Errorf("connection failed; wanted to succeed: %v", err)
+		}
+
+		// all should fail
+		bl.success = false
+		for _, fs := range filesystems {
+			if err := fs.Check(context.TODO(), "test", nil); err == nil {
+				t.Errorf("connection succeeded; wanted to fail")
+			}
+		}
 	}
 
-	bl.success = false
-	if err := fs.Check(context.TODO(), "test", nil); err == nil {
-		t.Errorf("connection succeeded; wanted to fail")
-	}
 }
 
 type breakableLayer struct {

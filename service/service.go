@@ -107,7 +107,7 @@ func NewSociSnapshotterService(ctx context.Context, root string, serviceCfg *con
 	if serviceCfg.FSConfig.MaxConcurrency != 0 {
 		fsOpts = append(fsOpts, socifs.WithMaxConcurrency(serviceCfg.FSConfig.MaxConcurrency))
 	}
-	fs, err := socifs.NewFilesystem(ctx, fsRoot(root), serviceCfg.FSConfig, fsOpts...)
+	filesystems, err := socifs.NewFilesystems(ctx, fsRoot(root), serviceCfg.FSConfig, fsOpts...)
 	if err != nil {
 		log.G(ctx).WithError(err).Fatalf("failed to configure filesystem")
 	}
@@ -121,11 +121,8 @@ func NewSociSnapshotterService(ctx context.Context, root string, serviceCfg *con
 	if serviceCfg.SnapshotterConfig.AllowInvalidMountsOnRestart {
 		snOpts = append(snOpts, snbase.AllowInvalidMountsOnRestart)
 	}
-	if serviceCfg.PullModes.Parallel.Enable {
-		snOpts = append(snOpts, snbase.ParallelPullUnpack)
-	}
 
-	snapshotter, err = snbase.NewSnapshotter(ctx, snapshotterRoot(root), fs, snOpts...)
+	snapshotter, err = snbase.NewSnapshotter(ctx, snapshotterRoot(root), filesystems, snOpts...)
 	if err != nil {
 		log.G(ctx).WithError(err).Fatalf("failed to create new snapshotter")
 	}

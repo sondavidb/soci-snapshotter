@@ -169,6 +169,8 @@ type options struct {
 	overlayOpaqueType layer.OverlayOpaqueType
 	maxConcurrency    int64
 	pullModes         config.PullModes
+	client            *store.ContainerdClient
+	store             store.Store
 }
 
 func WithGetSources(s source.GetSources) Option {
@@ -210,12 +212,77 @@ func WithPullModes(pullModes config.PullModes) Option {
 	}
 }
 
-func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts ...Option) (_ snapshot.FileSystem, err error) {
+func NewFilesystems(ctx context.Context, root string, cfg config.FSConfig, opts ...Option) (_ []snapshot.FileSystem, err error) {
 	var fsOpts options
 	for _, o := range opts {
 		o(&fsOpts)
 	}
 
+	filesystems := []snapshot.FileSystem{}
+
+	if fsOpts.getSources == nil {
+		fsOpts.getSources = source.FromDefaultLabels(func(imgRefSpec reference.Spec) (hosts []docker.RegistryHost, _ error) {
+			return docker.ConfigureDefaultRegistries(docker.WithPlainHTTP(docker.MatchLocalhost))(imgRefSpec.Hostname())
+		})
+	}
+	if fsOpts.client == nil {
+		fsOpts.client = store.NewContainerdClient(cfg.ContentStoreConfig.ContainerdAddress)
+	}
+	if fsOpts.store == nil {
+		store, err := store.NewContentStore(
+			store.WithType(cfg.ContentStoreConfig.Type),
+			store.WithContainerdAddress(cfg.ContentStoreConfig.ContainerdAddress),
+			store.WithClient(fsOpts.client),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create content store: %w", err)
+		}
+		fsOpts.store = store
+	}
+
+	if fsOpts.pullModes.Parallel.Enable {
+		parallelFS, err := NewParallelFilesystem(ctx, root, cfg, fsOpts)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create parallel filesystem: %w", err)
+		}
+		filesystems = append(filesystems, parallelFS)
+	} else {
+		remoteFS, err := NewRemoteFilesystem(ctx, root, cfg, fsOpts)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create remote filesystem: %w", err)
+		}
+		localFS, err := NewLocalFilesystem(ctx, root, cfg, fsOpts)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create local filesystem: %w", err)
+		}
+		filesystems = append(filesystems, remoteFS, localFS)
+	}
+
+	return filesystems, nil
+}
+
+type remoteFS struct {
+	ctx                         context.Context
+	resolver                    *layer.Resolver
+	debug                       bool
+	layer                       map[string]layer.Layer
+	layerMu                     sync.Mutex
+	disableVerification         bool
+	getSources                  source.GetSources
+	metricsController           *layermetrics.Controller
+	attrTimeout                 time.Duration
+	entryTimeout                time.Duration
+	negativeTimeout             time.Duration
+	sociContexts                sync.Map
+	contentStore                store.Store
+	bgFetcher                   *bf.BackgroundFetcher
+	mountTimeout                time.Duration
+	fuseMetricsEmitWaitDuration time.Duration
+	pr                          *preresolver
+	pullModes                   config.PullModes
+}
+
+func NewRemoteFilesystem(ctx context.Context, root string, cfg config.FSConfig, fsOpts options) (*remoteFS, error) {
 	var (
 		mountTimeout                = time.Duration(cfg.MountTimeoutSec) * time.Second
 		fuseMetricsEmitWaitDuration = time.Duration(cfg.FuseMetricsEmitWaitDurationSec) * time.Second
@@ -230,32 +297,8 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 
 	metadataStore := fsOpts.metadataStore
 
-	getSources := fsOpts.getSources
-	if getSources == nil {
-		getSources = source.FromDefaultLabels(func(imgRefSpec reference.Spec) (hosts []docker.RegistryHost, _ error) {
-			return docker.ConfigureDefaultRegistries(docker.WithPlainHTTP(docker.MatchLocalhost))(imgRefSpec.Hostname())
-		})
-	}
-
-	pullModes := fsOpts.pullModes
-	// disable_lazy_loading should only work for containerd content store, unless we skip content store ingestion entirely
-	if pullModes.Parallel.Enable &&
-		cfg.ContentStoreConfig.Type != config.ContainerdContentStoreType &&
-		!pullModes.Parallel.DiscardUnpackedLayers {
-		return nil, errors.New("parallel_pull_unpack mode requires containerd content store (type=\"containerd\" under [content_store])")
-	}
-	client := store.NewContainerdClient(cfg.ContentStoreConfig.ContainerdAddress)
-
-	store, err := store.NewContentStore(
-		store.WithType(cfg.ContentStoreConfig.Type),
-		store.WithContainerdAddress(cfg.ContentStoreConfig.ContainerdAddress),
-		store.WithClient(client),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create content store: %w", err)
-	}
-
 	var bgFetcher *bf.BackgroundFetcher
+	var err error
 
 	if !cfg.BackgroundFetchConfig.Disable {
 		log.G(context.Background()).WithFields(logrus.Fields{
@@ -278,7 +321,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		log.G(context.Background()).Info("background fetch is disabled")
 	}
 
-	r, err := layer.NewResolver(root, cfg, fsOpts.resolveHandlers, metadataStore, store, fsOpts.overlayOpaqueType, bgFetcher)
+	r, err := layer.NewResolver(root, cfg, fsOpts.resolveHandlers, metadataStore, fsOpts.store, fsOpts.overlayOpaqueType, bgFetcher)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup resolver: %w", err)
 	}
@@ -298,17 +341,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 
 	go commonmetrics.ListenForFuseFailure(ctx)
 
-	storage, err := newLayerUnpackDiskStorage(filepath.Dir(root))
-	if err != nil {
-		return nil, fmt.Errorf("error creating unpack directory on disk: %w", err)
-	}
-
-	unpackJobs, err := createParallelPullStructs(ctx, storage, &pullModes.Parallel)
-	if err != nil {
-		return nil, err
-	}
-
-	return &filesystem{
+	return &remoteFS{
 		// it's generally considered bad practice to store a context in a struct,
 		// however `filesystem` has it's own lifecycle as well as a per-request lifecycle.
 		// Some operations (e.g. remote calls) exist within a per-request lifecycle and use
@@ -318,7 +351,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		// to it later.
 		ctx:                         ctx,
 		resolver:                    r,
-		getSources:                  getSources,
+		getSources:                  fsOpts.getSources,
 		debug:                       cfg.Debug,
 		layer:                       make(map[string]layer.Layer),
 		disableVerification:         cfg.DisableVerification,
@@ -326,656 +359,20 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		attrTimeout:                 attrTimeout,
 		entryTimeout:                entryTimeout,
 		negativeTimeout:             negativeTimeout,
-		contentStore:                store,
+		contentStore:                fsOpts.store,
 		bgFetcher:                   bgFetcher,
 		mountTimeout:                mountTimeout,
 		fuseMetricsEmitWaitDuration: fuseMetricsEmitWaitDuration,
 		pr:                          pr,
-		pullModes:                   pullModes,
-		containerd:                  client,
-		inProgressImageUnpacks:      unpackJobs,
+		pullModes:                   fsOpts.pullModes,
 	}, nil
 }
 
-func createParallelPullStructs(ctx context.Context, storage LayerUnpackJobStorage, parallelConfig *config.Parallel) (*unpackJobs, error) {
-	if !parallelConfig.Enable {
-		return nil, nil
-	}
-
-	if err := compression.InitializeDecompressStreams(parallelConfig.DecompressStreams); err != nil {
-		return nil, fmt.Errorf("error initializing decompress streams: %w", err)
-	}
-
-	unpackJobs, err := newUnpackJobs(ctx, parallelConfig, storage)
-	if err != nil {
-		return nil, fmt.Errorf("error creating unpack jobs: %w", err)
-	}
-	return unpackJobs, nil
+func (fs *remoteFS) Type() snapshot.FSType {
+	return snapshot.RemoteFS
 }
 
-type sociContext struct {
-	cachedErr            error
-	bgFetchPauseOnce     sync.Once
-	fetchOnce            sync.Once
-	sociIndex            *soci.Index
-	imageLayerToSociDesc map[string]ocispec.Descriptor
-	fuseOperationCounter *layer.FuseOperationCounter
-}
-
-func (c *sociContext) Init(ctx context.Context, fs *filesystem, imageRef, indexDigest, imageManifestDigest string, client *http.Client) error {
-	c.fetchOnce.Do(func() {
-		index, err := fs.fetchSociIndex(ctx, imageRef, indexDigest, imageManifestDigest, client)
-		if err != nil {
-			c.cachedErr = err
-			return
-		}
-		c.sociIndex = index
-		c.populateImageLayerToSociMapping(index)
-
-		// Create the FUSE operation counter.
-		// Metrics are emitted after a wait time of fuseOpEmitWaitDuration.
-		c.fuseOperationCounter = layer.NewFuseOperationCounter(digest.Digest(imageManifestDigest), fs.fuseMetricsEmitWaitDuration)
-		go c.fuseOperationCounter.Run(fs.ctx)
-	})
-	return c.cachedErr
-}
-
-func (c *sociContext) populateImageLayerToSociMapping(sociIndex *soci.Index) {
-	c.imageLayerToSociDesc = make(map[string]ocispec.Descriptor, len(sociIndex.Blobs))
-	for _, desc := range sociIndex.Blobs {
-		ociDigest := desc.Annotations[soci.IndexAnnotationImageLayerDigest]
-		c.imageLayerToSociDesc[ociDigest] = desc
-	}
-}
-
-type filesystem struct {
-	ctx                         context.Context
-	resolver                    *layer.Resolver
-	debug                       bool
-	layer                       map[string]layer.Layer
-	layerMu                     sync.Mutex
-	disableVerification         bool
-	getSources                  source.GetSources
-	metricsController           *layermetrics.Controller
-	attrTimeout                 time.Duration
-	entryTimeout                time.Duration
-	negativeTimeout             time.Duration
-	sociContexts                sync.Map
-	contentStore                store.Store
-	bgFetcher                   *bf.BackgroundFetcher
-	mountTimeout                time.Duration
-	fuseMetricsEmitWaitDuration time.Duration
-	pr                          *preresolver
-	pullModes                   config.PullModes
-	containerd                  *store.ContainerdClient
-	inProgressImageUnpacks      *unpackJobs
-}
-
-func (fs *filesystem) MountParallel(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
-	if !fs.pullModes.Parallel.Enable {
-		return ErrParallelPullIsDisabled
-	}
-
-	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
-	if !ok {
-		return fmt.Errorf("unable to get image ref from labels")
-	}
-	// Get source information of this layer.
-	src, err := fs.getSources(labels)
-	if err != nil {
-		return err
-	} else if len(src) == 0 {
-		return fmt.Errorf("blob info not found for any labels in %s", fmt.Sprint(labels))
-	}
-	// download the target layer
-	s := src[0]
-	client := s.Hosts[0].Client
-	refspec, err := reference.Parse(imageRef)
-	if err != nil {
-		return fmt.Errorf("cannot parse image ref (%s): %w", imageRef, err)
-	}
-	desc := s.Target
-	imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
-	if !ok {
-		return errors.New("layer has no image manifest attached")
-	}
-	// If lazy-loading is disabled and the image has no jobs associated with it, start premounting all jobs
-	if !fs.inProgressImageUnpacks.ImageExists(imageDigest) {
-		err := fs.preloadAllLayers(ctx, desc, imageDigest, refspec, client)
-		if err != nil {
-			return fmt.Errorf("failed to preload layers for image manifest digest %s: %w", imageDigest, err)
-		}
-	}
-
-	err = fs.rebase(ctx, desc.Digest, imageDigest, mountpoint)
-	if err != nil {
-		return fmt.Errorf("failed to rebase layer %s: %w", desc.Digest, err)
-	}
-	return nil
-}
-
-func (fs *filesystem) preloadAllLayers(ctx context.Context, desc ocispec.Descriptor, imageDigest string, refspec reference.Spec, cachedClient *http.Client) error {
-	manifest, err := fs.getImageManifest(ctx, imageDigest)
-	if err != nil {
-		return fmt.Errorf("cannot get image manifest: %w", err)
-	}
-	diffIDMap, err := fs.getDiffIDMap(ctx, manifest)
-	if err != nil {
-		return fmt.Errorf("error getting uncompressed shasums for image %s: %v", desc.Digest, err)
-	}
-
-	ns, ok := namespaces.Namespace(ctx)
-	if !ok {
-		return errors.New("namespace not attached to context")
-	}
-	// Clone client if it's our internal [socihttp.AuthClient]
-	// so that this image pull request has an isolated client reference.
-	client := cachedClient
-	if authClient, ok := cachedClient.Transport.(*socihttp.AuthClient); ok {
-		retryClient := resolver.CloneRetryableClient(authClient.Client())
-		// The clone will have a cleaned cache
-		newAuthClient := authClient.CloneWithNewClient(retryClient)
-		// It's worth noting we don't ever directly clear the cache after this.
-		// This client is used to create the remoteStore, which falls
-		// out of scope after all layers are finished premounting,
-		// which should trigger Go's garbage collector, so it should
-		// be safe to never clear the cache and let Go handle it.
-		newAuthClient.CacheRedirects(true)
-		client = &http.Client{
-			Transport: newAuthClient,
-		}
-	}
-	remoteStore, err := newRemoteBlobStore(refspec, client)
-	if err != nil {
-		return fmt.Errorf("cannot create remote store: %w", err)
-	}
-
-	premountCtx, cancel := context.WithCancelCause(context.Background())
-	premountCtx = namespaces.WithNamespace(premountCtx, ns)
-	imageJob := fs.inProgressImageUnpacks.GetOrAddImageJob(imageDigest, cancel)
-
-	// If we fail anywhere after making the image job, we must remove the associated image job
-	premountAll := func() error {
-		// We only want to premount all layers that don't exist yet.
-		// Since layer order is deterministic, we can safely assume that
-		// every layer after this needs to be premounted as well.
-		startPremounting := false
-		for _, l := range manifest.Layers {
-			if images.IsLayerType(l.MediaType) {
-				if l.Digest.String() == desc.Digest.String() {
-					startPremounting = true
-
-					// We don't have to preauthorize if we only do one request at a time
-					if fs.inProgressImageUnpacks.imagePullCfg.MaxConcurrentDownloadsPerImage != 1 {
-						err = remoteStore.doInitialFetch(ctx, constructRef(refspec, desc))
-						if err != nil {
-							return fmt.Errorf("error doing initial client fetch: %w", err)
-						}
-					}
-				}
-				if startPremounting {
-					layerJob, err := fs.inProgressImageUnpacks.AddLayerJob(imageJob, l.Digest.String())
-					if err != nil {
-						return fmt.Errorf("error adding layer job: %w", err)
-					}
-					go fs.premount(premountCtx, l, refspec, remoteStore, diffIDMap, layerJob)
-				}
-			}
-		}
-		return nil
-	}
-
-	if err := premountAll(); err != nil {
-		fs.inProgressImageUnpacks.RemoveImageWithError(imageDigest, err)
-	}
-	return err
-}
-
-func (fs *filesystem) premount(ctx context.Context, desc ocispec.Descriptor, refspec reference.Spec, remoteStore resolverStorage, diffIDMap map[string]digest.Digest, layerJob *layerUnpackJob) error {
-	var err error
-	defer func() {
-		// If there is a context error (usually context cancelled),
-		// rebase will not get called for this layer,
-		// so we need to make sure to remove this job.
-		if cErr := ctx.Err(); cErr != nil {
-			err = cErr
-		}
-		if err != nil {
-			fs.inProgressImageUnpacks.RemoveImageWithError(layerJob.imageDigest, err)
-		}
-		layerJob.errCh <- err
-		close(layerJob.errCh)
-	}()
-
-	uncompressedDigest, ok := diffIDMap[desc.Digest.String()]
-	if !ok {
-		return fmt.Errorf("digest %s not found in image manifest", desc.Digest.String())
-	}
-
-	var decompressStream compression.DecompressStream
-	if ds, ok := compression.GetDecompressStream(desc.MediaType); ok {
-		decompressStream = ds
-	}
-
-	// If we discard unpacked layers, we must verify layer integrity ourselves.
-	var compressedVerifier digest.Verifier
-	if fs.pullModes.Parallel.DiscardUnpackedLayers {
-		compressedVerifier = desc.Digest.Verifier()
-	}
-
-	archive := NewLayerArchive(compressedVerifier, uncompressedDigest.Verifier(), decompressStream)
-	chunkSize := fs.pullModes.Parallel.ConcurrentDownloadChunkSize
-	fetcher, err := newParallelArtifactFetcher(refspec, fs.contentStore, remoteStore, layerJob, chunkSize)
-	if err != nil {
-		log.G(ctx).WithError(err).Error("cannot create fetcher")
-		return err
-	}
-
-	unpacker := NewParallelLayerUnpacker(fetcher, archive, layerJob, fs.pullModes.Parallel.DiscardUnpackedLayers)
-	fsPath := layerJob.GetUnpackUpperPath()
-	err = unpacker.Unpack(ctx, desc, fsPath, []mount.Mount{})
-	if err != nil {
-		log.G(ctx).WithError(err).WithField("digest", desc.Digest).Error("cannot unpack layer")
-	}
-	return err
-}
-
-func (fs *filesystem) rebase(ctx context.Context, dgst digest.Digest, imageDigest, mountpoint string) error {
-	layerJob, err := fs.inProgressImageUnpacks.Claim(imageDigest, dgst.String())
-	if err != nil {
-		fs.inProgressImageUnpacks.RemoveImageWithError(imageDigest, err)
-		return fmt.Errorf("error attempting to claim job to rebase: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			layerJob.Cancel(err)
-			fs.inProgressImageUnpacks.RemoveImageWithError(layerJob.imageDigest, err)
-		} else {
-			fs.inProgressImageUnpacks.Remove(layerJob, err)
-		}
-	}()
-
-	log.G(ctx).WithField("digest", dgst).Debug("claimed layer")
-
-	select {
-	case <-ctx.Done():
-		err = ctx.Err()
-		return err
-	case err = <-layerJob.errCh:
-		if err != nil {
-			return err
-		}
-	}
-
-	if layerJob.status.Load() == LayerUnpackJobCancelled {
-		return errors.New("layer unpack job cancelled")
-	}
-
-	tempDir := layerJob.GetUnpackUpperPath()
-	if _, err = os.Stat(tempDir); err != nil {
-		return fmt.Errorf("error statting temporary unpack directory %s: %w", tempDir, err)
-	}
-
-	var file os.FileInfo
-	if file, err = os.Stat(mountpoint); err == nil {
-		if file.IsDir() {
-			// Make sure directory is empty
-			f, err := os.Open(mountpoint)
-			if err != nil {
-				return fmt.Errorf("error opening up preexisting mountpoint %s: %w", mountpoint, err)
-			}
-
-			_, err = f.Readdirnames(1)
-			if err != io.EOF {
-				// If mountpoint is not empty, refuse to rebase to location
-				f.Close()
-				if err == nil {
-					err = gofs.ErrExist
-				}
-				return err
-			}
-			f.Close()
-		}
-		os.RemoveAll(mountpoint)
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("error statting mountpoint %s: %w", mountpoint, err)
-	}
-
-	if err = os.MkdirAll(filepath.Dir(mountpoint), 0700); err != nil {
-		return fmt.Errorf("error creating mountpoint %s on disk: %w", mountpoint, err)
-	}
-
-	if err = os.Rename(tempDir, mountpoint); err != nil {
-		return fmt.Errorf("error moving temp unpack dir %s to mountpoint %s: %w", tempDir, mountpoint, err)
-	}
-
-	return nil
-}
-
-func (fs *filesystem) getDiffIDMap(ctx context.Context, imageManifest *ocispec.Manifest) (map[string]digest.Digest, error) {
-	client, err := fs.containerd.Client()
-	if err != nil {
-		return nil, err
-	}
-
-	buf, err := content.ReadBlob(ctx, client.ContentStore(), imageManifest.Config)
-	if err != nil {
-		return nil, err
-	}
-
-	imgConfig := ocispec.Image{}
-	err = json.Unmarshal(buf, &imgConfig)
-	if err != nil {
-		return nil, fmt.Errorf("error unmarshalling image config JSON: %v", err)
-	}
-
-	uncompressedShas := imgConfig.RootFS.DiffIDs
-	compressedShas := imageManifest.Layers
-	if len(uncompressedShas) != len(compressedShas) {
-		return nil, fmt.Errorf("mismatch between manifest layers and diff IDs")
-	}
-
-	diffIDMap := map[string]digest.Digest{}
-	for i := range len(uncompressedShas) {
-		diffIDMap[compressedShas[i].Digest.String()] = uncompressedShas[i]
-	}
-
-	return diffIDMap, nil
-}
-
-func (fs *filesystem) getImageManifest(ctx context.Context, dgst string) (*ocispec.Manifest, error) {
-	client, err := fs.containerd.Client()
-	if err != nil {
-		return nil, err
-	}
-
-	manifestDigest, _ := digest.Parse(dgst)
-	manifestDesc := ocispec.Descriptor{
-		Digest: manifestDigest,
-	}
-	buf, err := content.ReadBlob(ctx, client.ContentStore(), manifestDesc)
-	if err != nil {
-		return nil, err
-	}
-
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(buf, &manifest); err != nil {
-		return nil, err
-	}
-
-	return &manifest, nil
-}
-
-// CleanImage stops all parallel operations for the specific image.
-// Generally this will be called when removing a snapshot for an image.
-func (fs *filesystem) CleanImage(ctx context.Context, imgDigest string) error {
-	if !fs.pullModes.Parallel.Enable {
-		return nil
-	}
-
-	err := fs.inProgressImageUnpacks.RemoveImageWithError(imgDigest, context.Canceled)
-	if !errors.Is(err, ErrImageUnpackJobNotFound) && err != nil {
-		return fmt.Errorf("error removing image: %w", err)
-	}
-	return nil
-}
-
-func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
-	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
-	if !ok {
-		return fmt.Errorf("unable to get image ref from labels")
-	}
-	// Get source information of this layer.
-	src, err := fs.getSources(labels)
-	if err != nil {
-		return err
-	} else if len(src) == 0 {
-		return fmt.Errorf("blob info not found for any labels in %s", fmt.Sprint(labels))
-	}
-	// download the target layer
-	s := src[0]
-	client := s.Hosts[0].Client
-	refspec, err := reference.Parse(imageRef)
-	if err != nil {
-		return fmt.Errorf("cannot parse image ref (%s): %w", imageRef, err)
-	}
-	remoteStore, err := newRemoteBlobStore(refspec, client)
-	if err != nil {
-		return fmt.Errorf("cannot create remote store: %w", err)
-	}
-	fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore)
-	if err != nil {
-		return fmt.Errorf("cannot create fetcher: %w", err)
-	}
-
-	desc := s.Target
-
-	// If the descriptor size is zero, the artifact fetcher will resolve it.
-	// However, it never returns this resolved descriptor.
-	// Since the unpacker is also in charge of storing the content and the
-	// ORAS store requires an expected size, we need to resolve here.
-	if desc.Size == 0 {
-		// In remoteStore.Reference, Registry and Target should be correct.
-		// However, we need Reference to point to the current layer.
-		blobRef := remoteStore.Reference
-		blobRef.Reference = s.Target.Digest.String()
-		desc, err = remoteStore.Resolve(ctx, blobRef.String())
-		if err != nil {
-			return fmt.Errorf("cannot resolve size of layer (%s): %w", blobRef.String(), err)
-		}
-	}
-
-	imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
-	if !ok {
-		return errors.New("layer has no image manifest attached")
-	}
-	manifest, err := fs.getImageManifest(ctx, imageDigest)
-	if err != nil {
-		return fmt.Errorf("cannot get image manifest: %w", err)
-	}
-	diffIDMap, err := fs.getDiffIDMap(ctx, manifest)
-	if err != nil {
-		return fmt.Errorf("error getting uncompressed shasums for image %s: %v", desc.Digest, err)
-	}
-	uncompressedDigest, ok := diffIDMap[desc.Digest.String()]
-	if !ok {
-		return fmt.Errorf("digest %s not found in image manifest", desc.Digest.String())
-	}
-
-	archive := NewLayerArchive(nil, uncompressedDigest.Verifier(), nil)
-	unpacker := NewLayerUnpacker(fetcher, archive)
-
-	err = unpacker.Unpack(ctx, desc, mountpoint, mounts)
-	if err != nil {
-		return fmt.Errorf("cannot unpack the layer: %w", err)
-	}
-
-	return nil
-}
-
-func (fs *filesystem) getSociContext(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*sociContext, error) {
-	cAny, _ := fs.sociContexts.LoadOrStore(imageManifestDigest, &sociContext{})
-	c, ok := cAny.(*sociContext)
-	if !ok {
-		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", indexDigest)
-	}
-	err := c.Init(ctx, fs, imageRef, indexDigest, imageManifestDigest, client)
-	return c, err
-}
-
-func (fs *filesystem) fetchSociIndex(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*soci.Index, error) {
-	refspec, err := reference.Parse(imageRef)
-	if err != nil {
-		return nil, err
-	}
-
-	remoteStore, err := newRemoteStore(refspec, client)
-	if err != nil {
-		return nil, err
-	}
-
-	indexDesc, err := fs.findSociIndexDesc(ctx, imageManifestDigest, indexDigest, remoteStore)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", snapshot.ErrNoIndex, err)
-	}
-
-	log.G(ctx).WithField("digest", indexDesc.Digest.String()).Infof("fetching SOCI artifacts using index descriptor")
-
-	index, err := FetchSociArtifacts(ctx, refspec, indexDesc, fs.contentStore, remoteStore)
-	if err != nil {
-		return nil, fmt.Errorf("%w: error trying to fetch SOCI artifacts: %w", snapshot.ErrNoIndex, err)
-	}
-	return index, nil
-}
-
-func (fs *filesystem) findSociIndexDesc(ctx context.Context, imageManifestDigest string, sociIndexDigest string, remoteStore *orasremote.Repository) (ocispec.Descriptor, error) {
-	imgDigest, err := digest.Parse(imageManifestDigest)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("unable to parse image digest: %w", err)
-	}
-
-	// 1. Try to find an explicit index digest
-	if sociIndexDigest != "" {
-		log.G(ctx).Debug("using provided soci index digest")
-		return parseIndexDigest(sociIndexDigest)
-	}
-	log.G(ctx).Debug("index digest not provided")
-
-	if !fs.pullModes.SOCIv1.Enable && !fs.pullModes.SOCIv2.Enable {
-		return ocispec.Descriptor{}, ErrAllLazyPullModesDisabled
-	}
-
-	// 2. Try to find an index digest in the manifest labels if SOCI v2 is enabled.
-	if fs.pullModes.SOCIv2.Enable {
-		log.G(ctx).Debug("checking for soci v2 index annotation")
-		desc, err := findSociIndexDescAnnotation(ctx, imgDigest, remoteStore)
-		if err == nil {
-			log.G(ctx).Debug("using soci v2 index annotation")
-			return desc, nil
-		}
-		if !errors.Is(err, errdefs.ErrNotFound) {
-			return ocispec.Descriptor{}, err
-		}
-		log.G(ctx).Debug("soci v2 index annotation not found")
-	} else {
-		log.G(ctx).Debug("soci v2 is disabled")
-	}
-
-	// 3. Try to find an index using the referrers API if SOCI v1 is enabled.
-	if fs.pullModes.SOCIv1.Enable {
-		log.G(ctx).Debug("checking for soci v1 index via referrers API")
-		desc, err := findSociIndexDescReferrer(ctx, imgDigest, remoteStore)
-		if err == nil {
-			log.G(ctx).Debug("using soci v1 index via referrers API")
-			return desc, nil
-		}
-		if !errors.Is(err, ErrNoReferrers) {
-			return ocispec.Descriptor{}, err
-		}
-		log.G(ctx).Debug("soci v1 referrers not found")
-	} else {
-		log.G(ctx).Debug("soci v1 is disabled")
-	}
-
-	return ocispec.Descriptor{}, errdefs.ErrNotFound
-}
-
-func parseIndexDigest(sociIndexDigest string) (ocispec.Descriptor, error) {
-	dg, err := digest.Parse(sociIndexDigest)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("unable to parse SOCI index digest: %w", err)
-	}
-	return ocispec.Descriptor{
-		Digest: dg,
-	}, nil
-}
-
-func findSociIndexDescAnnotation(ctx context.Context, imgDigest digest.Digest, remoteStore *orasremote.Repository) (ocispec.Descriptor, error) {
-	ref := remoteStore.Reference
-	ref.Reference = imgDigest.String()
-	_, r, err := remoteStore.Manifests().FetchReference(ctx, ref.Reference)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("could not fetch manifest: %w", err)
-	}
-	var manifest ocispec.Manifest
-	err = json.NewDecoder(r).Decode(&manifest)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("could not unmarshal manifest: %w", err)
-	}
-	if manifest.Annotations == nil {
-		return ocispec.Descriptor{}, errdefs.ErrNotFound
-	}
-
-	indexDigestStr := manifest.Annotations[soci.ImageAnnotationSociIndexDigest]
-	if indexDigestStr != "" {
-		return parseIndexDigest(indexDigestStr)
-	}
-	return ocispec.Descriptor{}, errdefs.ErrNotFound
-}
-
-func findSociIndexDescReferrer(ctx context.Context, imgDigest digest.Digest, remoteStore *orasremote.Repository) (ocispec.Descriptor, error) {
-	artifactClient := NewOCIArtifactClient(remoteStore)
-
-	desc, err := artifactClient.SelectReferrer(ctx, ocispec.Descriptor{Digest: imgDigest}, defaultIndexSelectionPolicy)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("cannot fetch list of referrers: %w", err)
-	}
-	return desc, nil
-}
-
-func getIDMappedMountpoint(mountpoint, activeLayerID string) string {
-	d := filepath.Dir(mountpoint)
-	return filepath.Join(fmt.Sprintf("%s_%s", d, activeLayerID), "fs")
-}
-
-func (fs *filesystem) IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmapper idtools.IDMap) (string, error) {
-	newMountpoint := getIDMappedMountpoint(mountpoint, activeLayerID)
-	logger := log.G(ctx).WithField("mountpoint", newMountpoint)
-
-	logger.Debug("creating remote id-mapped mount")
-	if err := os.Mkdir(filepath.Dir(newMountpoint), 0700); err != nil {
-		return "", err
-	}
-	if err := os.Mkdir(newMountpoint, 0755); err != nil {
-		return "", err
-	}
-
-	fs.layerMu.Lock()
-	l := fs.layer[mountpoint]
-	if l == nil {
-		fs.layerMu.Unlock()
-		logger.Error("failed to create remote id-mapped mount")
-		return "", errdefs.ErrNotFound
-	}
-	fs.layer[newMountpoint] = l
-	fs.layerMu.Unlock()
-	node, err := l.RootNode(0, idmapper)
-	if err != nil {
-		return "", err
-	}
-
-	fuseLogger := log.L.
-		WithField("mountpoint", mountpoint).
-		WriterLevel(logrus.TraceLevel)
-
-	return newMountpoint, fs.setupFuseServer(ctx, newMountpoint, node, l, fuseLogger, nil)
-}
-
-func (fs *filesystem) IDMapMountLocal(ctx context.Context, mountpoint, activeLayerID string, idmapper idtools.IDMap) (string, error) {
-	newMountpoint := getIDMappedMountpoint(mountpoint, activeLayerID)
-	logger := log.G(ctx).WithField("mountpoint", newMountpoint)
-
-	logger.Debug("creating local id-mapped mount")
-	if err := idtools.RemapDir(ctx, mountpoint, newMountpoint, idmapper); err != nil {
-		logger.WithError(err).Error("failed to create local mount")
-		return "", err
-	}
-
-	logger.Debug("successfully created local mountpoint")
-	return newMountpoint, nil
-}
-
-func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[string]string) (retErr error) {
+func (fs *remoteFS) Mount(ctx context.Context, mountpoint string, labels map[string]string, _ []mount.Mount) (retErr error) {
 	// Setting the start time to measure the Mount operation duration.
 	start := time.Now()
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("mountpoint", mountpoint))
@@ -1112,7 +509,40 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	return
 }
 
-func (fs *filesystem) setupFuseServer(ctx context.Context, mountpoint string, node fusefs.InodeEmbedder, l layer.Layer, logger *io.PipeWriter, c *sociContext) error {
+func (fs *remoteFS) IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmapper idtools.IDMap) (string, error) {
+	newMountpoint := getIDMappedMountpoint(mountpoint, activeLayerID)
+	logger := log.G(ctx).WithField("mountpoint", newMountpoint)
+
+	logger.Debug("creating remote id-mapped mount")
+	if err := os.Mkdir(filepath.Dir(newMountpoint), 0700); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(newMountpoint, 0755); err != nil {
+		return "", err
+	}
+
+	fs.layerMu.Lock()
+	l := fs.layer[mountpoint]
+	if l == nil {
+		fs.layerMu.Unlock()
+		logger.Error("failed to create remote id-mapped mount")
+		return "", errdefs.ErrNotFound
+	}
+	fs.layer[newMountpoint] = l
+	fs.layerMu.Unlock()
+	node, err := l.RootNode(0, idmapper)
+	if err != nil {
+		return "", err
+	}
+
+	fuseLogger := log.L.
+		WithField("mountpoint", mountpoint).
+		WriterLevel(logrus.TraceLevel)
+
+	return newMountpoint, fs.setupFuseServer(ctx, newMountpoint, node, l, fuseLogger, nil)
+}
+
+func (fs *remoteFS) setupFuseServer(ctx context.Context, mountpoint string, node fusefs.InodeEmbedder, l layer.Layer, logger *io.PipeWriter, c *sociContext) error {
 	// mount the node to the specified mountpoint
 	// TODO: bind mount the state directory as a read-only fs on snapshotter's side
 	rawFS := fusefs.NewNodeFS(node, &fusefs.Options{
@@ -1155,7 +585,7 @@ func (fs *filesystem) setupFuseServer(ctx context.Context, mountpoint string, no
 	return server.WaitMount()
 }
 
-func (fs *filesystem) Check(ctx context.Context, mountpoint string, labels map[string]string) error {
+func (fs *remoteFS) Check(ctx context.Context, mountpoint string, labels map[string]string) error {
 
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("mountpoint", mountpoint))
 
@@ -1179,7 +609,7 @@ func (fs *filesystem) Check(ctx context.Context, mountpoint string, labels map[s
 	return nil
 }
 
-func (fs *filesystem) check(ctx context.Context, l layer.Layer, labels map[string]string) error {
+func (fs *remoteFS) check(ctx context.Context, l layer.Layer, labels map[string]string) error {
 	err := l.Check()
 	if err == nil {
 		return nil
@@ -1213,12 +643,7 @@ func (fs *filesystem) check(ctx context.Context, l layer.Layer, labels map[strin
 	return rErr
 }
 
-func isIDMappedDir(mountpoint string) bool {
-	dirName := filepath.Base(mountpoint)
-	return len(strings.Split(dirName, "_")) > 1
-}
-
-func (fs *filesystem) Unmount(ctx context.Context, mountpoint string) error {
+func (fs *remoteFS) Unmount(ctx context.Context, mountpoint string) error {
 	fs.layerMu.Lock()
 	l, ok := fs.layer[mountpoint]
 	if !ok {
@@ -1240,6 +665,686 @@ func (fs *filesystem) Unmount(ctx context.Context, mountpoint string) error {
 	// goroutine using channel, etc.
 	// See also: https://www.kernel.org/doc/html/latest/filesystems/fuse.html#aborting-a-filesystem-connection
 	return syscall.Unmount(mountpoint, syscall.MNT_FORCE)
+}
+
+// Nothing extra needs to be cleaned on snapshot removal
+func (fs *remoteFS) CleanImage(ctx context.Context, imgDigest string) error {
+	return nil
+}
+
+type sociContext struct {
+	cachedErr            error
+	bgFetchPauseOnce     sync.Once
+	fetchOnce            sync.Once
+	sociIndex            *soci.Index
+	imageLayerToSociDesc map[string]ocispec.Descriptor
+	fuseOperationCounter *layer.FuseOperationCounter
+}
+
+func (c *sociContext) Init(ctx context.Context, fs *remoteFS, imageRef, indexDigest, imageManifestDigest string, client *http.Client) error {
+	c.fetchOnce.Do(func() {
+		index, err := fs.fetchSociIndex(ctx, imageRef, indexDigest, imageManifestDigest, client)
+		if err != nil {
+			c.cachedErr = err
+			return
+		}
+		c.sociIndex = index
+		c.populateImageLayerToSociMapping(index)
+
+		// Create the FUSE operation counter.
+		// Metrics are emitted after a wait time of fuseOpEmitWaitDuration.
+		c.fuseOperationCounter = layer.NewFuseOperationCounter(digest.Digest(imageManifestDigest), fs.fuseMetricsEmitWaitDuration)
+		go c.fuseOperationCounter.Run(fs.ctx)
+	})
+	return c.cachedErr
+}
+
+func (c *sociContext) populateImageLayerToSociMapping(sociIndex *soci.Index) {
+	c.imageLayerToSociDesc = make(map[string]ocispec.Descriptor, len(sociIndex.Blobs))
+	for _, desc := range sociIndex.Blobs {
+		ociDigest := desc.Annotations[soci.IndexAnnotationImageLayerDigest]
+		c.imageLayerToSociDesc[ociDigest] = desc
+	}
+}
+
+func (fs *remoteFS) getSociContext(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*sociContext, error) {
+	cAny, _ := fs.sociContexts.LoadOrStore(imageManifestDigest, &sociContext{})
+	c, ok := cAny.(*sociContext)
+	if !ok {
+		return nil, fmt.Errorf("could not load index: fs soci context is invalid type for %s", indexDigest)
+	}
+	err := c.Init(ctx, fs, imageRef, indexDigest, imageManifestDigest, client)
+	return c, err
+}
+
+func (fs *remoteFS) fetchSociIndex(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*soci.Index, error) {
+	refspec, err := reference.Parse(imageRef)
+	if err != nil {
+		return nil, err
+	}
+
+	remoteStore, err := newRemoteStore(refspec, client)
+	if err != nil {
+		return nil, err
+	}
+
+	indexDesc, err := fs.findSociIndexDesc(ctx, imageManifestDigest, indexDigest, remoteStore)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", snapshot.ErrNoIndex, err)
+	}
+
+	log.G(ctx).WithField("digest", indexDesc.Digest.String()).Infof("fetching SOCI artifacts using index descriptor")
+
+	index, err := FetchSociArtifacts(ctx, refspec, indexDesc, fs.contentStore, remoteStore)
+	if err != nil {
+		return nil, fmt.Errorf("%w: error trying to fetch SOCI artifacts: %w", snapshot.ErrNoIndex, err)
+	}
+	return index, nil
+}
+
+func (fs *remoteFS) findSociIndexDesc(ctx context.Context, imageManifestDigest string, sociIndexDigest string, remoteStore *orasremote.Repository) (ocispec.Descriptor, error) {
+	imgDigest, err := digest.Parse(imageManifestDigest)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("unable to parse image digest: %w", err)
+	}
+
+	// 1. Try to find an explicit index digest
+	if sociIndexDigest != "" {
+		log.G(ctx).Debug("using provided soci index digest")
+		return parseIndexDigest(sociIndexDigest)
+	}
+	log.G(ctx).Debug("index digest not provided")
+
+	if !fs.pullModes.SOCIv1.Enable && !fs.pullModes.SOCIv2.Enable {
+		return ocispec.Descriptor{}, ErrAllLazyPullModesDisabled
+	}
+
+	// 2. Try to find an index digest in the manifest labels if SOCI v2 is enabled.
+	if fs.pullModes.SOCIv2.Enable {
+		log.G(ctx).Debug("checking for soci v2 index annotation")
+		desc, err := findSociIndexDescAnnotation(ctx, imgDigest, remoteStore)
+		if err == nil {
+			log.G(ctx).Debug("using soci v2 index annotation")
+			return desc, nil
+		}
+		if !errors.Is(err, errdefs.ErrNotFound) {
+			return ocispec.Descriptor{}, err
+		}
+		log.G(ctx).Debug("soci v2 index annotation not found")
+	} else {
+		log.G(ctx).Debug("soci v2 is disabled")
+	}
+
+	// 3. Try to find an index using the referrers API if SOCI v1 is enabled.
+	if fs.pullModes.SOCIv1.Enable {
+		log.G(ctx).Debug("checking for soci v1 index via referrers API")
+		desc, err := findSociIndexDescReferrer(ctx, imgDigest, remoteStore)
+		if err == nil {
+			log.G(ctx).Debug("using soci v1 index via referrers API")
+			return desc, nil
+		}
+		if !errors.Is(err, ErrNoReferrers) {
+			return ocispec.Descriptor{}, err
+		}
+		log.G(ctx).Debug("soci v1 referrers not found")
+	} else {
+		log.G(ctx).Debug("soci v1 is disabled")
+	}
+
+	return ocispec.Descriptor{}, errdefs.ErrNotFound
+}
+
+type localFS struct {
+	getSources   source.GetSources
+	contentStore store.Store
+	containerd   *store.ContainerdClient
+}
+
+func NewLocalFilesystem(ctx context.Context, root string, cfg config.FSConfig, fsOpts options) (*localFS, error) {
+	return &localFS{
+		getSources:   fsOpts.getSources,
+		contentStore: fsOpts.store,
+		containerd:   fsOpts.client,
+	}, nil
+}
+
+func (fs *localFS) Type() snapshot.FSType {
+	return snapshot.LocalFS
+}
+
+func (fs *localFS) Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
+	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
+	if !ok {
+		return fmt.Errorf("unable to get image ref from labels")
+	}
+	// Get source information of this layer.
+	src, err := fs.getSources(labels)
+	if err != nil {
+		return err
+	} else if len(src) == 0 {
+		return fmt.Errorf("blob info not found for any labels in %s", fmt.Sprint(labels))
+	}
+	// download the target layer
+	s := src[0]
+	client := s.Hosts[0].Client
+	refspec, err := reference.Parse(imageRef)
+	if err != nil {
+		return fmt.Errorf("cannot parse image ref (%s): %w", imageRef, err)
+	}
+	remoteStore, err := newRemoteBlobStore(refspec, client)
+	if err != nil {
+		return fmt.Errorf("cannot create remote store: %w", err)
+	}
+	fetcher, err := newArtifactFetcher(refspec, fs.contentStore, remoteStore)
+	if err != nil {
+		return fmt.Errorf("cannot create fetcher: %w", err)
+	}
+
+	desc := s.Target
+
+	// If the descriptor size is zero, the artifact fetcher will resolve it.
+	// However, it never returns this resolved descriptor.
+	// Since the unpacker is also in charge of storing the content and the
+	// ORAS store requires an expected size, we need to resolve here.
+	if desc.Size == 0 {
+		// In remoteStore.Reference, Registry and Target should be correct.
+		// However, we need Reference to point to the current layer.
+		blobRef := remoteStore.Reference
+		blobRef.Reference = s.Target.Digest.String()
+		desc, err = remoteStore.Resolve(ctx, blobRef.String())
+		if err != nil {
+			return fmt.Errorf("cannot resolve size of layer (%s): %w", blobRef.String(), err)
+		}
+	}
+
+	imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
+	if !ok {
+		return errors.New("layer has no image manifest attached")
+	}
+	manifest, err := getImageManifest(ctx, fs.containerd, imageDigest)
+	if err != nil {
+		return fmt.Errorf("cannot get image manifest: %w", err)
+	}
+	diffIDMap, err := getDiffIDMap(ctx, fs.containerd, manifest)
+	if err != nil {
+		return fmt.Errorf("error getting uncompressed shasums for image %s: %v", desc.Digest, err)
+	}
+	uncompressedDigest, ok := diffIDMap[desc.Digest.String()]
+	if !ok {
+		return fmt.Errorf("digest %s not found in image manifest", desc.Digest.String())
+	}
+
+	archive := NewLayerArchive(nil, uncompressedDigest.Verifier(), nil)
+	unpacker := NewLayerUnpacker(fetcher, archive)
+
+	err = unpacker.Unpack(ctx, desc, mountpoint, mounts)
+	if err != nil {
+		return fmt.Errorf("cannot unpack the layer: %w", err)
+	}
+
+	return nil
+}
+
+func (fs *localFS) IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmapper idtools.IDMap) (string, error) {
+	newMountpoint := getIDMappedMountpoint(mountpoint, activeLayerID)
+	logger := log.G(ctx).WithField("mountpoint", newMountpoint)
+
+	logger.Debug("creating local id-mapped mount")
+	if err := idtools.RemapDir(ctx, mountpoint, newMountpoint, idmapper); err != nil {
+		logger.WithError(err).Error("failed to create local mount")
+		return "", err
+	}
+
+	logger.Debug("successfully created local mountpoint")
+	return newMountpoint, nil
+}
+
+// Check only really makes sense in a lazy-loaded setting and should not be called for local mounts
+func (fs *localFS) Check(ctx context.Context, mountpoint string, labels map[string]string) error {
+	return snapshot.ErrNotSupported
+}
+
+// Calling Unmount on a local mount should do nothing
+func (fs *localFS) Unmount(ctx context.Context, mountpoint string) error {
+	return nil
+}
+
+// Nothing extra needs to be cleaned on snapshot removal
+func (fs *localFS) CleanImage(ctx context.Context, imgDigest string) error {
+	return nil
+}
+
+type parallelFS struct {
+	getSources             source.GetSources
+	contentStore           store.Store
+	parallelCfg            config.Parallel
+	containerd             *store.ContainerdClient
+	inProgressImageUnpacks *unpackJobs
+}
+
+func NewParallelFilesystem(ctx context.Context, root string, cfg config.FSConfig, fsOpts options) (*parallelFS, error) {
+	storage, err := newLayerUnpackDiskStorage(filepath.Dir(root))
+	if err != nil {
+		return nil, fmt.Errorf("error creating unpack directory on disk: %w", err)
+	}
+
+	pullModes := fsOpts.pullModes
+	// parallel_pull should only work for containerd content store, unless we skip content store ingestion entirely
+	if pullModes.Parallel.Enable &&
+		cfg.ContentStoreConfig.Type != config.ContainerdContentStoreType &&
+		!pullModes.Parallel.DiscardUnpackedLayers {
+		return nil, errors.New("parallel_pull_unpack mode requires containerd content store (type=\"containerd\" under [content_store])")
+	}
+
+	unpackJobs, err := createParallelPullStructs(ctx, storage, &pullModes.Parallel)
+	if err != nil {
+		return nil, err
+	}
+
+	return &parallelFS{
+		getSources:             fsOpts.getSources,
+		contentStore:           fsOpts.store,
+		parallelCfg:            pullModes.Parallel,
+		containerd:             fsOpts.client,
+		inProgressImageUnpacks: unpackJobs,
+	}, nil
+}
+
+func createParallelPullStructs(ctx context.Context, storage LayerUnpackJobStorage, parallelConfig *config.Parallel) (*unpackJobs, error) {
+	if !parallelConfig.Enable {
+		return nil, nil
+	}
+
+	if err := compression.InitializeDecompressStreams(parallelConfig.DecompressStreams); err != nil {
+		return nil, fmt.Errorf("error initializing decompress streams: %w", err)
+	}
+
+	unpackJobs, err := newUnpackJobs(ctx, parallelConfig, storage)
+	if err != nil {
+		return nil, fmt.Errorf("error creating unpack jobs: %w", err)
+	}
+	return unpackJobs, nil
+}
+
+func (fs *parallelFS) Type() snapshot.FSType {
+	return snapshot.ParallelFS
+}
+
+func (fs *parallelFS) Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
+	if !fs.parallelCfg.Enable {
+		return ErrParallelPullIsDisabled
+	}
+
+	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
+	if !ok {
+		return fmt.Errorf("unable to get image ref from labels")
+	}
+	// Get source information of this layer.
+	src, err := fs.getSources(labels)
+	if err != nil {
+		return err
+	} else if len(src) == 0 {
+		return fmt.Errorf("blob info not found for any labels in %s", fmt.Sprint(labels))
+	}
+	// download the target layer
+	s := src[0]
+	client := s.Hosts[0].Client
+	refspec, err := reference.Parse(imageRef)
+	if err != nil {
+		return fmt.Errorf("cannot parse image ref (%s): %w", imageRef, err)
+	}
+	desc := s.Target
+	imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
+	if !ok {
+		return errors.New("layer has no image manifest attached")
+	}
+	// If lazy-loading is disabled and the image has no jobs associated with it, start premounting all jobs
+	if !fs.inProgressImageUnpacks.ImageExists(imageDigest) {
+		err := fs.preloadAllLayers(ctx, desc, imageDigest, refspec, client)
+		if err != nil {
+			return fmt.Errorf("failed to preload layers for image manifest digest %s: %w", imageDigest, err)
+		}
+	}
+
+	err = fs.rebase(ctx, desc.Digest, imageDigest, mountpoint)
+	if err != nil {
+		return fmt.Errorf("failed to rebase layer %s: %w", desc.Digest, err)
+	}
+	return nil
+}
+
+func (fs *parallelFS) preloadAllLayers(ctx context.Context, desc ocispec.Descriptor, imageDigest string, refspec reference.Spec, cachedClient *http.Client) error {
+	manifest, err := getImageManifest(ctx, fs.containerd, imageDigest)
+	if err != nil {
+		return fmt.Errorf("cannot get image manifest: %w", err)
+	}
+	diffIDMap, err := getDiffIDMap(ctx, fs.containerd, manifest)
+	if err != nil {
+		return fmt.Errorf("error getting uncompressed shasums for image %s: %v", desc.Digest, err)
+	}
+
+	ns, ok := namespaces.Namespace(ctx)
+	if !ok {
+		return errors.New("namespace not attached to context")
+	}
+	// Clone client if it's our internal [socihttp.AuthClient]
+	// so that this image pull request has an isolated client reference.
+	client := cachedClient
+	if authClient, ok := cachedClient.Transport.(*socihttp.AuthClient); ok {
+		retryClient := resolver.CloneRetryableClient(authClient.Client())
+		// The clone will have a cleaned cache
+		newAuthClient := authClient.CloneWithNewClient(retryClient)
+		// It's worth noting we don't ever directly clear the cache after this.
+		// This client is used to create the remoteStore, which falls
+		// out of scope after all layers are finished premounting,
+		// which should trigger Go's garbage collector, so it should
+		// be safe to never clear the cache and let Go handle it.
+		newAuthClient.CacheRedirects(true)
+		client = &http.Client{
+			Transport: newAuthClient,
+		}
+	}
+	remoteStore, err := newRemoteBlobStore(refspec, client)
+	if err != nil {
+		return fmt.Errorf("cannot create remote store: %w", err)
+	}
+
+	premountCtx, cancel := context.WithCancelCause(context.Background())
+	premountCtx = namespaces.WithNamespace(premountCtx, ns)
+	imageJob := fs.inProgressImageUnpacks.GetOrAddImageJob(imageDigest, cancel)
+
+	// If we fail anywhere after making the image job, we must remove the associated image job
+	premountAll := func() error {
+		// We only want to premount all layers that don't exist yet.
+		// Since layer order is deterministic, we can safely assume that
+		// every layer after this needs to be premounted as well.
+		startPremounting := false
+		for _, l := range manifest.Layers {
+			if images.IsLayerType(l.MediaType) {
+				if l.Digest.String() == desc.Digest.String() {
+					startPremounting = true
+
+					// We don't have to preauthorize if we only do one request at a time
+					if fs.inProgressImageUnpacks.imagePullCfg.MaxConcurrentDownloadsPerImage != 1 {
+						err = remoteStore.doInitialFetch(ctx, constructRef(refspec, desc))
+						if err != nil {
+							return fmt.Errorf("error doing initial client fetch: %w", err)
+						}
+					}
+				}
+				if startPremounting {
+					layerJob, err := fs.inProgressImageUnpacks.AddLayerJob(imageJob, l.Digest.String())
+					if err != nil {
+						return fmt.Errorf("error adding layer job: %w", err)
+					}
+					go fs.premount(premountCtx, l, refspec, remoteStore, diffIDMap, layerJob)
+				}
+			}
+		}
+		return nil
+	}
+
+	if err := premountAll(); err != nil {
+		fs.inProgressImageUnpacks.RemoveImageWithError(imageDigest, err)
+	}
+	return err
+}
+
+func (fs *parallelFS) premount(ctx context.Context, desc ocispec.Descriptor, refspec reference.Spec, remoteStore resolverStorage, diffIDMap map[string]digest.Digest, layerJob *layerUnpackJob) error {
+	var err error
+	defer func() {
+		// If there is a context error (usually context cancelled),
+		// rebase will not get called for this layer,
+		// so we need to make sure to remove this job.
+		if cErr := ctx.Err(); cErr != nil {
+			err = cErr
+		}
+		if err != nil {
+			fs.inProgressImageUnpacks.RemoveImageWithError(layerJob.imageDigest, err)
+		}
+		layerJob.errCh <- err
+		close(layerJob.errCh)
+	}()
+
+	uncompressedDigest, ok := diffIDMap[desc.Digest.String()]
+	if !ok {
+		return fmt.Errorf("digest %s not found in image manifest", desc.Digest.String())
+	}
+
+	var decompressStream compression.DecompressStream
+	if ds, ok := compression.GetDecompressStream(desc.MediaType); ok {
+		decompressStream = ds
+	}
+
+	// If we discard unpacked layers, we must verify layer integrity ourselves.
+	var compressedVerifier digest.Verifier
+	if fs.parallelCfg.DiscardUnpackedLayers {
+		compressedVerifier = desc.Digest.Verifier()
+	}
+
+	archive := NewLayerArchive(compressedVerifier, uncompressedDigest.Verifier(), decompressStream)
+	chunkSize := fs.parallelCfg.ConcurrentDownloadChunkSize
+	fetcher, err := newParallelArtifactFetcher(refspec, fs.contentStore, remoteStore, layerJob, chunkSize)
+	if err != nil {
+		log.G(ctx).WithError(err).Error("cannot create fetcher")
+		return err
+	}
+
+	unpacker := NewParallelLayerUnpacker(fetcher, archive, layerJob, fs.parallelCfg.DiscardUnpackedLayers)
+	fsPath := layerJob.GetUnpackUpperPath()
+	err = unpacker.Unpack(ctx, desc, fsPath, []mount.Mount{})
+	if err != nil {
+		log.G(ctx).WithError(err).WithField("digest", desc.Digest).Error("cannot unpack layer")
+	}
+	return err
+}
+
+func (fs *parallelFS) rebase(ctx context.Context, dgst digest.Digest, imageDigest, mountpoint string) error {
+	layerJob, err := fs.inProgressImageUnpacks.Claim(imageDigest, dgst.String())
+	if err != nil {
+		fs.inProgressImageUnpacks.RemoveImageWithError(imageDigest, err)
+		return fmt.Errorf("error attempting to claim job to rebase: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			layerJob.Cancel(err)
+			fs.inProgressImageUnpacks.RemoveImageWithError(layerJob.imageDigest, err)
+		} else {
+			fs.inProgressImageUnpacks.Remove(layerJob, err)
+		}
+	}()
+
+	log.G(ctx).WithField("digest", dgst).Debug("claimed layer")
+
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return err
+	case err = <-layerJob.errCh:
+		if err != nil {
+			return err
+		}
+	}
+
+	if layerJob.status.Load() == LayerUnpackJobCancelled {
+		return errors.New("layer unpack job cancelled")
+	}
+
+	tempDir := layerJob.GetUnpackUpperPath()
+	if _, err = os.Stat(tempDir); err != nil {
+		return fmt.Errorf("error statting temporary unpack directory %s: %w", tempDir, err)
+	}
+
+	var file os.FileInfo
+	if file, err = os.Stat(mountpoint); err == nil {
+		if file.IsDir() {
+			// Make sure directory is empty
+			f, err := os.Open(mountpoint)
+			if err != nil {
+				return fmt.Errorf("error opening up preexisting mountpoint %s: %w", mountpoint, err)
+			}
+
+			_, err = f.Readdirnames(1)
+			if err != io.EOF {
+				// If mountpoint is not empty, refuse to rebase to location
+				f.Close()
+				if err == nil {
+					err = gofs.ErrExist
+				}
+				return err
+			}
+			f.Close()
+		}
+		os.RemoveAll(mountpoint)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("error statting mountpoint %s: %w", mountpoint, err)
+	}
+
+	if err = os.MkdirAll(filepath.Dir(mountpoint), 0700); err != nil {
+		return fmt.Errorf("error creating mountpoint %s on disk: %w", mountpoint, err)
+	}
+
+	if err = os.Rename(tempDir, mountpoint); err != nil {
+		return fmt.Errorf("error moving temp unpack dir %s to mountpoint %s: %w", tempDir, mountpoint, err)
+	}
+
+	return nil
+}
+
+// We don't support ID-mapping for parallel pull operations
+func (fs *parallelFS) IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmap idtools.IDMap) (string, error) {
+	return "", snapshot.ErrNotSupported
+}
+
+// Check should never be called on the parallel FS
+func (fs *parallelFS) Check(ctx context.Context, mountpoint string, labels map[string]string) error {
+	return snapshot.ErrNotSupported
+}
+
+// Calling Unmount in the parallel FS should do nothing
+func (fs *parallelFS) Unmount(ctx context.Context, mountpoint string) error {
+	return nil
+}
+
+func getDiffIDMap(ctx context.Context, ctdClient *store.ContainerdClient, imageManifest *ocispec.Manifest) (map[string]digest.Digest, error) {
+	client, err := ctdClient.Client()
+	if err != nil {
+		return nil, err
+	}
+
+	buf, err := content.ReadBlob(ctx, client.ContentStore(), imageManifest.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	imgConfig := ocispec.Image{}
+	err = json.Unmarshal(buf, &imgConfig)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling image config JSON: %v", err)
+	}
+
+	uncompressedShas := imgConfig.RootFS.DiffIDs
+	compressedShas := imageManifest.Layers
+	if len(uncompressedShas) != len(compressedShas) {
+		return nil, fmt.Errorf("mismatch between manifest layers and diff IDs")
+	}
+
+	diffIDMap := map[string]digest.Digest{}
+	for i := range len(uncompressedShas) {
+		diffIDMap[compressedShas[i].Digest.String()] = uncompressedShas[i]
+	}
+
+	return diffIDMap, nil
+}
+
+func getImageManifest(ctx context.Context, ctdClient *store.ContainerdClient, dgst string) (*ocispec.Manifest, error) {
+	client, err := ctdClient.Client()
+	if err != nil {
+		return nil, err
+	}
+
+	manifestDigest, _ := digest.Parse(dgst)
+	manifestDesc := ocispec.Descriptor{
+		Digest: manifestDigest,
+	}
+	buf, err := content.ReadBlob(ctx, client.ContentStore(), manifestDesc)
+	if err != nil {
+		return nil, err
+	}
+
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(buf, &manifest); err != nil {
+		return nil, err
+	}
+
+	return &manifest, nil
+}
+
+// CleanImage stops all parallel operations for the specific image.
+// Generally this will be called when removing a snapshot for an image.
+func (fs *parallelFS) CleanImage(ctx context.Context, imgDigest string) error {
+	if !fs.parallelCfg.Enable {
+		return nil
+	}
+
+	err := fs.inProgressImageUnpacks.RemoveImageWithError(imgDigest, context.Canceled)
+	if !errors.Is(err, ErrImageUnpackJobNotFound) && err != nil {
+		return fmt.Errorf("error removing image: %w", err)
+	}
+	return nil
+}
+
+func parseIndexDigest(sociIndexDigest string) (ocispec.Descriptor, error) {
+	dg, err := digest.Parse(sociIndexDigest)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("unable to parse SOCI index digest: %w", err)
+	}
+	return ocispec.Descriptor{
+		Digest: dg,
+	}, nil
+}
+
+func findSociIndexDescAnnotation(ctx context.Context, imgDigest digest.Digest, remoteStore *orasremote.Repository) (ocispec.Descriptor, error) {
+	ref := remoteStore.Reference
+	ref.Reference = imgDigest.String()
+	_, r, err := remoteStore.Manifests().FetchReference(ctx, ref.Reference)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("could not fetch manifest: %w", err)
+	}
+	var manifest ocispec.Manifest
+	err = json.NewDecoder(r).Decode(&manifest)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("could not unmarshal manifest: %w", err)
+	}
+	if manifest.Annotations == nil {
+		return ocispec.Descriptor{}, errdefs.ErrNotFound
+	}
+
+	indexDigestStr := manifest.Annotations[soci.ImageAnnotationSociIndexDigest]
+	if indexDigestStr != "" {
+		return parseIndexDigest(indexDigestStr)
+	}
+	return ocispec.Descriptor{}, errdefs.ErrNotFound
+}
+
+func findSociIndexDescReferrer(ctx context.Context, imgDigest digest.Digest, remoteStore *orasremote.Repository) (ocispec.Descriptor, error) {
+	artifactClient := NewOCIArtifactClient(remoteStore)
+
+	desc, err := artifactClient.SelectReferrer(ctx, ocispec.Descriptor{Digest: imgDigest}, defaultIndexSelectionPolicy)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("cannot fetch list of referrers: %w", err)
+	}
+	return desc, nil
+}
+
+func getIDMappedMountpoint(mountpoint, activeLayerID string) string {
+	d := filepath.Dir(mountpoint)
+	return filepath.Join(fmt.Sprintf("%s_%s", d, activeLayerID), "fs")
+}
+
+func isIDMappedDir(mountpoint string) bool {
+	dirName := filepath.Base(mountpoint)
+	return len(strings.Split(dirName, "_")) > 1
 }
 
 // neighboringLayers returns layer descriptors except the `target` layer in the specified manifest.

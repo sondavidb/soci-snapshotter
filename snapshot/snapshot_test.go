@@ -73,7 +73,7 @@ func TestRemotePrepare(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := context.TODO()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(context.TODO(), root, bindFileSystem(t))
+	sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{bindFileSystem(t)})
 	if err != nil {
 		t.Fatalf("failed to make new remote snapshotter: %q", err)
 	}
@@ -120,7 +120,7 @@ func TestRemoteOverlay(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := context.TODO()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(context.TODO(), root, bindFileSystem(t))
+	sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{bindFileSystem(t)})
 	if err != nil {
 		t.Fatalf("failed to make new remote snapshotter: %q", err)
 	}
@@ -175,7 +175,7 @@ func TestRemoteCommit(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := context.TODO()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(context.TODO(), root, bindFileSystem(t))
+	sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{bindFileSystem(t)})
 	if err != nil {
 		t.Fatalf("failed to make new remote snapshotter: %q", err)
 	}
@@ -306,7 +306,7 @@ func TestFailureDetection(t *testing.T) {
 			ctx := context.TODO()
 			root := t.TempDir()
 			fi := bindFileSystem(t)
-			sn, err := NewSnapshotter(context.TODO(), root, fi)
+			sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{fi})
 			if err != nil {
 				t.Fatalf("failed to make new Snapshotter: %q", err)
 			}
@@ -386,7 +386,11 @@ type bindFs struct {
 	broken       map[string]bool
 }
 
-func (fs *bindFs) Mount(ctx context.Context, mountpoint string, labels map[string]string) error {
+func (fs *bindFs) Type() FSType {
+	return OtherFS
+}
+
+func (fs *bindFs) Mount(ctx context.Context, mountpoint string, labels map[string]string, _ []mount.Mount) error {
 	if _, ok := labels[brokenLabel]; ok {
 		fs.broken[mountpoint] = true
 	}
@@ -439,7 +443,11 @@ func dummyFileSystem() FileSystem { return &dummyFs{} }
 
 type dummyFs struct{}
 
-func (fs *dummyFs) Mount(ctx context.Context, mountpoint string, labels map[string]string) error {
+func (fs *dummyFs) Type() FSType {
+	return OtherFS
+}
+
+func (fs *dummyFs) Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
 	return fmt.Errorf("dummy")
 }
 
@@ -475,7 +483,7 @@ func (fs *dummyFs) CleanImage(ctx context.Context, digest string) error {
 // Tests backword-comaptibility of overlayfs snapshotter.
 
 func newSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
-	snapshotter, err := NewSnapshotter(context.TODO(), root, dummyFileSystem())
+	snapshotter, err := NewSnapshotter(context.TODO(), root, []FileSystem{dummyFileSystem()})
 	if err != nil {
 		return nil, nil, err
 	}

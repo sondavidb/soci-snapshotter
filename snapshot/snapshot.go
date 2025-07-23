@@ -82,6 +82,8 @@ const (
 )
 
 var (
+	//ErrNotSupported is returned by the FS if it does not support the operation
+	ErrNotSupported = errors.New("filesystem does not support this operation")
 	// ErrNoIndex is returned by `fs.Mount` when an image should not be lazy loaded
 	// because a SOCI index was not found
 	ErrNoIndex = errors.New("no valid SOCI index found")
@@ -94,8 +96,18 @@ var (
 	ErrNoNamespace = errors.New("context has no namespace attached")
 )
 
+type FSType string
+
+var (
+	RemoteFS   FSType = "remote"
+	LocalFS    FSType = "local"
+	ParallelFS FSType = "parallel"
+	OtherFS    FSType = "other"
+)
+
 // FileSystem is a backing filesystem abstraction.
 //
+// Type() returns the type of filesystem being used
 // Mount() tries to mount a remote snapshot to the specified mount point
 // directory. If succeed, the mountpoint directory will be treated as a layer
 // snapshot. If Mount() fails, the mountpoint directory MUST be cleaned up.
@@ -103,18 +115,14 @@ var (
 // every time the layer is used by containerd.
 // Unmount() is called to unmount a remote snapshot from the specified mount point
 // directory.
-// MountLocal() is called to download and decompress a layer to a mount point
-// directory. After that it applies the difference to the parent layers if there are any.
-// If succeeded, the mountpoint directory will be treated as a regular layer snapshot.
-// If MountLocal() fails, the mountpoint directory MUST be cleaned up.
+// IDMapMount() is called to mount a mountpoint with ID-mapping. If the backing FS
+// does not support ID-mapping, this should return an error.
 type FileSystem interface {
-	Mount(ctx context.Context, mountpoint string, labels map[string]string) error
+	Type() FSType
+	Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error
+	IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmap idtools.IDMap) (string, error)
 	Check(ctx context.Context, mountpoint string, labels map[string]string) error
 	Unmount(ctx context.Context, mountpoint string) error
-	MountLocal(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error
-	MountParallel(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error
-	IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmap idtools.IDMap) (string, error)
-	IDMapMountLocal(ctx context.Context, mountpoint, activeLayerID string, idmap idtools.IDMap) (string, error)
 	CleanImage(ctx context.Context, digest string) error
 }
 
@@ -152,32 +160,30 @@ func AllowInvalidMountsOnRestart(config *SnapshotterConfig) error {
 	return nil
 }
 
-func ParallelPullUnpack(config *SnapshotterConfig) error {
-	config.parallelPullUnpack = true
-	return nil
-}
-
 type snapshotter struct {
 	root        string
 	ms          *storage.MetaStore
 	asyncRemove bool
 
-	// fs is a filesystem that this snapshotter recognizes.
-	fs                          FileSystem
 	userxattr                   bool  // whether to enable "userxattr" mount option
 	minLayerSize                int64 // minimum layer size for remote mounting
 	allowInvalidMountsOnRestart bool
-	parallelPullUnpack          bool
 	idmapped                    *sync.Map
+
+	// Filesystems
+	remoteFS   FileSystem
+	localFS    FileSystem
+	parallelFS FileSystem
+	otherFS    FileSystem // usually just for testing
 }
 
 // NewSnapshotter returns a Snapshotter which can use unpacked remote layers
 // as snapshots. This is implemented based on the overlayfs snapshotter, so
 // diffs are stored under the provided root and a metadata file is stored under
 // the root as same as overlayfs snapshotter.
-func NewSnapshotter(ctx context.Context, root string, targetFs FileSystem, opts ...Opt) (snapshots.Snapshotter, error) {
-	if targetFs == nil {
-		return nil, fmt.Errorf("specify filesystem to use")
+func NewSnapshotter(ctx context.Context, root string, filesystems []FileSystem, opts ...Opt) (snapshots.Snapshotter, error) {
+	if len(filesystems) == 0 {
+		return nil, fmt.Errorf("specify filesystems to use")
 	}
 
 	var config SnapshotterConfig
@@ -217,12 +223,25 @@ func NewSnapshotter(ctx context.Context, root string, targetFs FileSystem, opts 
 		root:                        root,
 		ms:                          ms,
 		asyncRemove:                 config.asyncRemove,
-		fs:                          targetFs,
 		userxattr:                   userxattr,
 		minLayerSize:                config.minLayerSize,
 		allowInvalidMountsOnRestart: config.allowInvalidMountsOnRestart,
 		idmapped:                    idMap,
-		parallelPullUnpack:          config.parallelPullUnpack,
+	}
+
+	for _, fs := range filesystems {
+		switch t := fs.Type(); t {
+		case RemoteFS:
+			o.remoteFS = fs
+		case LocalFS:
+			o.localFS = fs
+		case ParallelFS:
+			o.parallelFS = fs
+		case OtherFS:
+			o.otherFS = fs
+		default:
+			return nil, fmt.Errorf("unrecognized filesystem type %s", t)
+		}
 	}
 
 	if err := o.restoreRemoteSnapshot(ctx); err != nil {
@@ -396,7 +415,7 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 	// remote snapshot prepare
 	// skip if parallel pull is enabled
 	if !o.skipRemoteSnapshotPrepare(lCtx, base.Labels) {
-		err := o.prepareRemoteSnapshot(lCtx, key, base.Labels)
+		err := o.prepareSnapshot(lCtx, RemoteFS, key, base.Labels, []mount.Mount{})
 		if err == nil {
 			base.Labels[remoteLabel] = remoteLabelVal       // Mark this snapshot as remote
 			base.Labels[source.HasSociIndexDigest] = "true" // Mark that this snapshot was loaded with a SOCI index
@@ -440,12 +459,12 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		return mounts, nil
 	}
 
-	if o.parallelPullUnpack {
+	if o.useParallelPull() {
 		log.G(ctx).WithField("layerDigest", base.Labels[ctdsnapshotters.TargetLayerDigestLabel]).Info("preparing snapshot with parallel pull/unpack")
-		err = o.prepareParallelPullSnapshot(lCtx, key, base.Labels, mounts)
+		err = o.prepareSnapshot(lCtx, ParallelFS, key, base.Labels, mounts)
 	} else {
 		log.G(ctx).WithField("layerDigest", base.Labels[ctdsnapshotters.TargetLayerDigestLabel]).Info("preparing snapshot as local snapshot")
-		err = o.prepareLocalSnapshot(lCtx, key, base.Labels, mounts)
+		err = o.prepareSnapshot(lCtx, LocalFS, key, base.Labels, mounts)
 		if err == nil {
 			base.Labels[source.HasSociIndexDigest] = "true" // Mark that this snapshot was loaded with a SOCI index
 		}
@@ -465,7 +484,7 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		return nil, err
 	}
 	log.G(lCtx).WithField(remoteSnapshotLogKey, prepareFailed).WithError(err).Debug("skipped preparing remote snapshot")
-	if o.parallelPullUnpack {
+	if o.useParallelPull() {
 		// If parallel pull/unpack fails, then we should not defer to the container runtime
 		// and just return the error.
 		return nil, err
@@ -478,8 +497,16 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 	return mounts, nil
 }
 
+func (o *snapshotter) lazyPullDisabled() bool {
+	return o.remoteFS == nil
+}
+
+func (o *snapshotter) useParallelPull() bool {
+	return o.lazyPullDisabled() && o.parallelFS != nil
+}
+
 func (o *snapshotter) skipRemoteSnapshotPrepare(ctx context.Context, labels map[string]string) bool {
-	if o.parallelPullUnpack {
+	if o.lazyPullDisabled() {
 		return true
 	}
 
@@ -635,10 +662,12 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		// In this case, in-flight operations will not get cancelled, so removing
 		// just the layer will not allow it to be requeued. So, we cancel all
 		// in-flight operations for an image when a layer is being removed.
-		dgst := sn.Labels[ctdsnapshotters.TargetManifestDigestLabel]
-		err = o.fs.CleanImage(ctx, dgst)
-		if err != nil {
-			err = fmt.Errorf("error cleaning image operations: %w", err)
+		if o.parallelFS != nil {
+			dgst := sn.Labels[ctdsnapshotters.TargetManifestDigestLabel]
+			err = o.parallelFS.CleanImage(ctx, dgst)
+			if err != nil {
+				err = fmt.Errorf("error cleaning image operations: %w", err)
+			}
 		}
 	}
 	return err
@@ -756,8 +785,8 @@ func (o *snapshotter) unmountSnapshotDirectory(ctx context.Context, dir string) 
 		}
 		return err
 	}
-	if mounted {
-		return o.fs.Unmount(ctx, mp)
+	if mounted { // only remoteFS can be unmounted
+		return o.remoteFS.Unmount(ctx, mp)
 	}
 	return nil
 }
@@ -949,7 +978,7 @@ func (o *snapshotter) createIDMapMounts(ctx context.Context, s storage.Snapshot,
 func (o *snapshotter) createIDMapMount(ctx context.Context, path, id string, idmap idtools.IDMap) error {
 	// s.ID is the shortest unique identifier for each new container,
 	// so append it to the end of the new mountpoint
-	_, err := o.fs.IDMapMount(ctx, path, id, idmap)
+	_, err := o.remoteFS.IDMapMount(ctx, path, id, idmap)
 	if errdefs.IsNotFound(err) {
 		// Remote mount failed, attempt to create a local id-mapped mount
 
@@ -958,7 +987,7 @@ func (o *snapshotter) createIDMapMount(ctx context.Context, path, id string, idm
 		if err := os.RemoveAll(dirtyDir); err != nil {
 			return err
 		}
-		_, err = o.fs.IDMapMountLocal(ctx, path, id, idmap)
+		_, err = o.localFS.IDMapMount(ctx, path, id, idmap)
 	}
 	return err
 }
@@ -1001,8 +1030,7 @@ func (o *snapshotter) unmountAllSnapshots(ctx context.Context, cleanupCommitted 
 	return nil
 }
 
-// prepareParallelPullSnapshot tries to prepare the snapshot and its associated image in parallel
-func (o *snapshotter) prepareParallelPullSnapshot(ctx context.Context, key string, labels map[string]string, mounts []mount.Mount) error {
+func (o *snapshotter) prepareSnapshot(ctx context.Context, fsType FSType, key string, labels map[string]string, mounts []mount.Mount) error {
 	ctx, t, err := o.ms.TransactionContext(ctx, false)
 	if err != nil {
 		return err
@@ -1013,43 +1041,20 @@ func (o *snapshotter) prepareParallelPullSnapshot(ctx context.Context, key strin
 		return err
 	}
 	mountpoint := o.upperPath(id)
-	log.G(ctx).Infof("preparing local filesystem at mountpoint=%v", mountpoint)
-	return o.fs.MountParallel(ctx, mountpoint, labels, mounts)
-}
 
-// prepareLocalSnapshot tries to prepare the snapshot as a local snapshot.
-func (o *snapshotter) prepareLocalSnapshot(ctx context.Context, key string, labels map[string]string, mounts []mount.Mount) error {
-	ctx, t, err := o.ms.TransactionContext(ctx, false)
-	if err != nil {
-		return err
-	}
-	defer t.Rollback()
-	id, _, _, err := storage.GetInfo(ctx, key)
-	if err != nil {
-		return err
-	}
-	mountpoint := o.upperPath(id)
-	log.G(ctx).Infof("preparing local filesystem at mountpoint=%v", mountpoint)
-	return o.fs.MountLocal(ctx, mountpoint, labels, mounts)
-}
-
-// prepareRemoteSnapshot tries to prepare the snapshot as a remote snapshot
-// using filesystems registered in this snapshotter.
-func (o *snapshotter) prepareRemoteSnapshot(ctx context.Context, key string, labels map[string]string) error {
-	ctx, t, err := o.ms.TransactionContext(ctx, false)
-	if err != nil {
-		return err
-	}
-	defer t.Rollback()
-	id, _, _, err := storage.GetInfo(ctx, key)
-	if err != nil {
-		return err
+	switch fsType {
+	case RemoteFS:
+		log.G(ctx).Infof("preparing remote filesystem mount at mountpoint=%v", mountpoint)
+		return o.remoteFS.Mount(ctx, mountpoint, labels, mounts)
+	case LocalFS:
+		log.G(ctx).Infof("preparing local filesystem mount at mountpoint=%v", mountpoint)
+		return o.localFS.Mount(ctx, mountpoint, labels, mounts)
+	case ParallelFS:
+		log.G(ctx).Infof("preparing parallel filesystem mount at mountpoint=%v", mountpoint)
+		return o.parallelFS.Mount(ctx, mountpoint, labels, mounts)
 	}
 
-	mountpoint := o.upperPath(id)
-	log.G(ctx).Infof("preparing filesystem mount at mountpoint=%v", mountpoint)
-
-	return o.fs.Mount(ctx, mountpoint, labels)
+	return fmt.Errorf("unrecognized filesystem type: %s", fsType)
 }
 
 // checkAvailability checks avaiability of the specified layer and all lower
@@ -1077,7 +1082,7 @@ func (o *snapshotter) checkAvailability(ctx context.Context, key string) bool {
 		if _, ok := info.Labels[remoteLabel]; ok {
 			eg.Go(func() error {
 				log.G(lCtx).Debug("checking mount point")
-				if err := o.fs.Check(egCtx, mp, info.Labels); err != nil {
+				if err := o.remoteFS.Check(egCtx, mp, info.Labels); err != nil {
 					log.G(lCtx).WithError(err).Warn("layer is unavailable")
 					return err
 				}
@@ -1122,7 +1127,7 @@ func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
 			return ErrNoNamespace
 		}
 		ctx = namespaces.WithNamespace(ctx, ns)
-		if err := o.prepareRemoteSnapshot(ctx, info.Name, info.Labels); err != nil {
+		if err := o.prepareSnapshot(ctx, RemoteFS, info.Name, info.Labels, []mount.Mount{}); err != nil {
 			if o.allowInvalidMountsOnRestart {
 				logrus.WithError(err).Warnf("failed to restore remote snapshot %s; remove this snapshot manually", info.Name)
 				// This snapshot mount is invalid but allow this.
