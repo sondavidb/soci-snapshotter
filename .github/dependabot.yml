@@ -4,6 +4,10 @@ updates:
   # Automatic upgrade for go modules.
   - package-ecosystem: "gomod"
     directories: ["/", "/cmd"]
+    groups:
+      go:
+        patterns:
+          - '.*'
     schedule:
       interval: "daily"
     ignore:
