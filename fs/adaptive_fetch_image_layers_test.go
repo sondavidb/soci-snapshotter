@@ -143,7 +143,7 @@ func TestInProgressJobsAreNotGarbageCollected(t *testing.T) {
 	disk.CreateCompletedImageUnpackJobs(3 * jobs)
 
 	inProgressJobs, _ := newUnpackJobs(testCtx, newEnableParallelPullConfig(), disk)
-	createEphemeralInProgressImageUnpackJob(t, inProgressJobs)
+	createEphemeralInProgressImageUnpackJob(testCtx, t, inProgressJobs)
 	await(3 * ticks)
 
 	disk.AssertAllUsedResourcesHaveNotBeenGarbageCollected(t, inProgressJobs)
@@ -160,7 +160,7 @@ func TestExpiredJobsAreGarbageCollected(t *testing.T) {
 
 	disk := newVirtualDisk()
 	inProgressJobs, _ := newUnpackJobs(testCtx, newEnableParallelPullConfig(), disk)
-	createExpiredInProgressImageUnpackJob(t, inProgressJobs)
+	createExpiredInProgressImageUnpackJob(testCtx, t, inProgressJobs)
 
 	await(3 * ticks)
 
@@ -184,15 +184,15 @@ func await(numberOfTicks int) {
 	}
 }
 
-func createEphemeralInProgressImageUnpackJob(t testing.TB, inProgressJobs *unpackJobs) {
-	imageJob := inProgressJobs.GetOrAddImageJob(helloWorldImageDigest, func(cause error) {})
-	_, err := inProgressJobs.AddLayerJob(imageJob, helloWorldLayerDigest)
+func createEphemeralInProgressImageUnpackJob(ctx context.Context, t testing.TB, inProgressJobs *unpackJobs) {
+	imageJob := inProgressJobs.GetOrAddImageJob(ctx, helloWorldImageDigest, func(cause error) {})
+	_, err := inProgressJobs.AddLayerJob(imageJob, helloWorldLayerDigest, 0)
 	if err != nil {
 		t.Fatalf("Failed to create ephemeral in-progress image unpack job: %v", err)
 	}
 }
 
-func createExpiredInProgressImageUnpackJob(t testing.TB, inProgressJobs *unpackJobs) {
+func createExpiredInProgressImageUnpackJob(ctx context.Context, t testing.TB, inProgressJobs *unpackJobs) {
 	originalNow := now
 	defer func() {
 		now = originalNow
@@ -203,8 +203,8 @@ func createExpiredInProgressImageUnpackJob(t testing.TB, inProgressJobs *unpackJ
 		return time.Now().Add(-1 * garbageCollectionJobExpiration)
 	}
 
-	imageJob := inProgressJobs.GetOrAddImageJob(helloWorldImageDigest, func(cause error) {})
-	_, err := inProgressJobs.AddLayerJob(imageJob, helloWorldLayerDigest)
+	imageJob := inProgressJobs.GetOrAddImageJob(ctx, helloWorldImageDigest, func(cause error) {})
+	_, err := inProgressJobs.AddLayerJob(imageJob, helloWorldLayerDigest, 0)
 	if err != nil {
 		t.Fatalf("Failed to create ephemeral in-progress image unpack job: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestLayerUnpackJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expected no setup error, got %v", err)
 	}
-	createEphemeralInProgressImageUnpackJob(t, inProgressJobs)
+	createEphemeralInProgressImageUnpackJob(testCtx, t, inProgressJobs)
 
 	ephemeralJob, err := inProgressJobs.Claim(helloWorldImageDigest, helloWorldLayerDigest)
 	if err != nil {

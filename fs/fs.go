@@ -492,7 +492,7 @@ func (fs *filesystem) preloadAllLayers(ctx context.Context, desc ocispec.Descrip
 
 	premountCtx, cancel := context.WithCancelCause(context.Background())
 	premountCtx = namespaces.WithNamespace(premountCtx, ns)
-	imageJob := fs.inProgressImageUnpacks.GetOrAddImageJob(imageDigest, cancel)
+	imageJob := fs.inProgressImageUnpacks.GetOrAddImageJob(premountCtx, imageDigest, cancel)
 
 	// If we fail anywhere after making the image job, we must remove the associated image job
 	premountAll := func() error {
@@ -500,7 +500,7 @@ func (fs *filesystem) preloadAllLayers(ctx context.Context, desc ocispec.Descrip
 		// Since layer order is deterministic, we can safely assume that
 		// every layer after this needs to be premounted as well.
 		startPremounting := false
-		for _, l := range manifest.Layers {
+		for i, l := range manifest.Layers {
 			if images.IsLayerType(l.MediaType) {
 				if l.Digest.String() == desc.Digest.String() {
 					startPremounting = true
@@ -514,7 +514,7 @@ func (fs *filesystem) preloadAllLayers(ctx context.Context, desc ocispec.Descrip
 					}
 				}
 				if startPremounting {
-					layerJob, err := fs.inProgressImageUnpacks.AddLayerJob(imageJob, l.Digest.String())
+					layerJob, err := fs.inProgressImageUnpacks.AddLayerJob(imageJob, l.Digest.String(), i)
 					if err != nil {
 						return fmt.Errorf("error adding layer job: %w", err)
 					}

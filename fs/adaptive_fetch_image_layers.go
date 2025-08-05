@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"maps"
@@ -33,6 +34,7 @@ import (
 	"time"
 
 	"github.com/awslabs/soci-snapshotter/config"
+	"github.com/awslabs/soci-snapshotter/util/queue"
 	"github.com/containerd/log"
 	"golang.org/x/sync/semaphore"
 )
@@ -79,36 +81,124 @@ var (
 	ErrLayerUnpackDestinationHasContent = errors.New("layer unpack destination has content")
 )
 
-type SemaphoreWithNil struct {
+type JobResourceAllocator struct {
+	pq  *queue.ThreadsafePriorityQueue
 	smp *semaphore.Weighted
 }
 
-func NewSemaphoreWithNil(n int64) *SemaphoreWithNil {
-	s := &SemaphoreWithNil{}
-	if n > unlimited {
-		s.smp = semaphore.NewWeighted(n)
+func NewJobResourceAllocator(ctx context.Context, maxDownloads int64) *JobResourceAllocator {
+	j := &JobResourceAllocator{}
+	if maxDownloads > unlimited {
+		j.pq = queue.NewThreadsafePriorityQueue(&jobPriorityQueue{})
+		j.smp = semaphore.NewWeighted(maxDownloads)
+
+		go func() {
+			// Pop over and over as long as we have semaphores.
+			for {
+				// Acquire will handle context errors if context is cancelled
+				err := j.smp.Acquire(ctx, 1)
+				if err != nil {
+					return
+				}
+				var x any
+				for ctx.Err() == nil {
+					x = j.pq.Pop()
+					if x != nil {
+						job := x.(*job)
+						close(job.readyCh)
+						break
+					}
+				}
+			}
+		}()
+
 	}
-	return s
+	return j
 }
 
-func (s *SemaphoreWithNil) Acquire(ctx context.Context, n int64) error {
-	if s.smp != nil {
-		return s.smp.Acquire(ctx, n)
+func (j *JobResourceAllocator) Acquire(ctx context.Context, priority int, hash uint32) error {
+	if j.smp == nil {
+		return nil
 	}
-	return nil
+
+	ch := make(chan bool)
+	j.pq.Push(&job{
+		priority: priority,
+		hash:     hash,
+		readyCh:  ch,
+	})
+
+	// channel will inform us when this job has been popped from the priority queue
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ch:
+		return nil
+	}
 }
 
-func (s *SemaphoreWithNil) Release(n int64) {
-	if s.smp != nil {
-		s.smp.Release(n)
+func (j *JobResourceAllocator) Release() {
+	if j.smp != nil {
+		j.smp.Release(1)
 	}
+}
+
+type job struct {
+	priority int
+	hash     uint32
+	readyCh  chan bool
+
+	index int
+}
+
+func CreateHash(dgst string, priority int, loopPos int64) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(fmt.Sprintf("%s%d%d", dgst, priority, loopPos)))
+	return h.Sum32()
+}
+
+type jobPriorityQueue []*job
+
+func (pq jobPriorityQueue) Len() int { return len(pq) }
+
+// Lower-priority items come first
+func (pq jobPriorityQueue) Less(i, j int) bool {
+	return pq[i].priority < pq[j].priority
+}
+
+func (pq jobPriorityQueue) Swap(i, j int) {
+	if pq.Len() == 0 {
+		return
+	}
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].index = i
+	pq[j].index = j
+}
+
+func (pq *jobPriorityQueue) Push(x any) {
+	n := len(*pq)
+	item := x.(*job)
+	item.index = n
+	*pq = append(*pq, item)
+}
+
+func (pq *jobPriorityQueue) Pop() any {
+	old := *pq
+	n := len(old)
+	if n <= 0 {
+		return nil
+	}
+	item := old[n-1]
+	item.index = -1
+	*pq = old[0 : n-1]
+	return item
 }
 
 type unpackJobs struct {
 	imagePullCfg *config.ParallelConfig
 
-	globalConcurrentDownloadsLimiter *SemaphoreWithNil
-	globalConcurrentUnpacksLimiter   *SemaphoreWithNil
+	globalConcurrentDownloadsLimiter *JobResourceAllocator
+	globalConcurrentUnpacksLimiter   *JobResourceAllocator
 
 	storage LayerUnpackJobStorage
 
@@ -145,8 +235,8 @@ func newUnpackJobs(ctx context.Context, parallelConfig *config.Parallel, storage
 
 	jobs := &unpackJobs{
 		imagePullCfg:                     &parallelConfig.ParallelConfig,
-		globalConcurrentDownloadsLimiter: NewSemaphoreWithNil(globalConcurrentDownloadsLimit),
-		globalConcurrentUnpacksLimiter:   NewSemaphoreWithNil(globalConcurrentUnpacksLimit),
+		globalConcurrentDownloadsLimiter: NewJobResourceAllocator(ctx, globalConcurrentDownloadsLimit),
+		globalConcurrentUnpacksLimiter:   NewJobResourceAllocator(ctx, globalConcurrentUnpacksLimit),
 		images:                           make(map[string]*imageUnpackJob),
 		storage:                          storage,
 		mu:                               sync.Mutex{},
@@ -181,7 +271,7 @@ func checkParallelPullUnpack(cfg *config.Parallel) error {
 // GetOrAddImageJob adds the requisite image job to unpackJobs.
 // If the job already exists, return nil.
 // Else, return the newly created imageUnpackJob.
-func (jobs *unpackJobs) GetOrAddImageJob(imageDigest string, cancel context.CancelCauseFunc) *imageUnpackJob {
+func (jobs *unpackJobs) GetOrAddImageJob(ctx context.Context, imageDigest string, cancel context.CancelCauseFunc) *imageUnpackJob {
 	jobs.mu.Lock()
 	defer jobs.mu.Unlock()
 
@@ -190,8 +280,8 @@ func (jobs *unpackJobs) GetOrAddImageJob(imageDigest string, cancel context.Canc
 	}
 
 	jobs.images[imageDigest] = newImageUnpackJob(imageDigest,
-		withImageDownloadsLimit(jobs.imagePullCfg.MaxConcurrentDownloadsPerImage),
-		withImageUnpacksLimit(jobs.imagePullCfg.MaxConcurrentUnpacksPerImage),
+		withImageDownloadsLimit(ctx, jobs.imagePullCfg.MaxConcurrentDownloadsPerImage),
+		withImageUnpacksLimit(ctx, jobs.imagePullCfg.MaxConcurrentUnpacksPerImage),
 		withGlobalConcurrentDownloadsLimiter(jobs.globalConcurrentDownloadsLimiter),
 		withGlobalConcurrentUnpacksLimiter(jobs.globalConcurrentUnpacksLimiter),
 		withCancelFunc(cancel),
@@ -201,11 +291,11 @@ func (jobs *unpackJobs) GetOrAddImageJob(imageDigest string, cancel context.Canc
 }
 
 // AddLayerJob both adds the job to the in-memory store and creates the requisite folder on disk
-func (jobs *unpackJobs) AddLayerJob(imageJob *imageUnpackJob, layerDigest string) (*layerUnpackJob, error) {
+func (jobs *unpackJobs) AddLayerJob(imageJob *imageUnpackJob, layerDigest string, priority int) (*layerUnpackJob, error) {
 	jobs.mu.Lock()
 	defer jobs.mu.Unlock()
 
-	layerJob, err := newLayerUnpackJob(layerDigest, jobs.storage, withImageUnpackJob(imageJob))
+	layerJob, err := newLayerUnpackJob(layerDigest, jobs.storage, priority, withImageUnpackJob(imageJob))
 	if err != nil {
 		return nil, err
 	}
@@ -500,44 +590,44 @@ type imageUnpackJob struct {
 	imageDigest       string
 	creationTimestamp int64
 
-	globalConcurrentDownloadsLimiter *SemaphoreWithNil
-	globalConcurrentUnpacksLimiter   *SemaphoreWithNil
-	concurrentDownloadsLimiter       *SemaphoreWithNil
-	concurrentUnpacksLimiter         *SemaphoreWithNil
+	globalConcurrentDownloadsLimiter *JobResourceAllocator
+	globalConcurrentUnpacksLimiter   *JobResourceAllocator
+	concurrentDownloadsLimiter       *JobResourceAllocator
+	concurrentUnpacksLimiter         *JobResourceAllocator
 
 	layers map[string][]*layerUnpackJob
 }
 
 type imageUnpackOption func(*imageUnpackJob)
 
-func withImageDownloadsLimit(limit int64) imageUnpackOption {
+func withImageDownloadsLimit(ctx context.Context, limit int64) imageUnpackOption {
 	return func(job *imageUnpackJob) {
 		if limit == config.Unbounded {
 			limit = unlimited
 		}
-		job.concurrentDownloadsLimiter = NewSemaphoreWithNil(limit)
+		job.concurrentDownloadsLimiter = NewJobResourceAllocator(ctx, limit)
 	}
 }
 
-func withImageUnpacksLimit(limit int64) imageUnpackOption {
+func withImageUnpacksLimit(ctx context.Context, limit int64) imageUnpackOption {
 	return func(job *imageUnpackJob) {
 		if limit == config.Unbounded {
 			limit = unlimited
 		}
-		job.concurrentUnpacksLimiter = NewSemaphoreWithNil(limit)
+		job.concurrentUnpacksLimiter = NewJobResourceAllocator(ctx, limit)
 	}
 }
 
-func withGlobalConcurrentDownloadsLimiter(smp *SemaphoreWithNil) imageUnpackOption {
+func withGlobalConcurrentDownloadsLimiter(j *JobResourceAllocator) imageUnpackOption {
 	return func(job *imageUnpackJob) {
-		job.globalConcurrentDownloadsLimiter = smp
+		job.globalConcurrentDownloadsLimiter = j
 	}
 
 }
 
-func withGlobalConcurrentUnpacksLimiter(smp *SemaphoreWithNil) imageUnpackOption {
+func withGlobalConcurrentUnpacksLimiter(j *JobResourceAllocator) imageUnpackOption {
 	return func(job *imageUnpackJob) {
-		job.globalConcurrentUnpacksLimiter = smp
+		job.globalConcurrentUnpacksLimiter = j
 	}
 }
 
@@ -558,10 +648,10 @@ func newImageUnpackJob(imageDigest string, opts ...imageUnpackOption) *imageUnpa
 		cancel:                           cancel,
 		imageDigest:                      imageDigest,
 		creationTimestamp:                now().UnixNano(),
-		globalConcurrentDownloadsLimiter: NewSemaphoreWithNil(unlimited),
-		globalConcurrentUnpacksLimiter:   NewSemaphoreWithNil(unlimited),
-		concurrentDownloadsLimiter:       NewSemaphoreWithNil(unlimited),
-		concurrentUnpacksLimiter:         NewSemaphoreWithNil(unlimited),
+		globalConcurrentDownloadsLimiter: NewJobResourceAllocator(ctx, unlimited),
+		globalConcurrentUnpacksLimiter:   NewJobResourceAllocator(ctx, unlimited),
+		concurrentDownloadsLimiter:       NewJobResourceAllocator(ctx, unlimited),
+		concurrentUnpacksLimiter:         NewJobResourceAllocator(ctx, unlimited),
 		layers:                           make(map[string][]*layerUnpackJob),
 	}
 
@@ -604,19 +694,22 @@ type layerUnpackJob struct {
 	// Inherit fields from parent via withImageUnpackJob
 	imageDigest                      string
 	cancel                           context.CancelCauseFunc
-	globalConcurrentDownloadsLimiter *SemaphoreWithNil
-	globalConcurrentUnpacksLimiter   *SemaphoreWithNil
-	concurrentDownloadsLimiter       *SemaphoreWithNil
-	concurrentUnpacksLimiter         *SemaphoreWithNil
+	globalConcurrentDownloadsLimiter *JobResourceAllocator
+	globalConcurrentUnpacksLimiter   *JobResourceAllocator
+	concurrentDownloadsLimiter       *JobResourceAllocator
+	concurrentUnpacksLimiter         *JobResourceAllocator
 	creationTimestamp                int64
 
 	// Unique to layerUnpackJob struct
+	priority      int
 	layerUnpackID string
 	layerDigest   string
 	ingestPath    string
 	upperPath     string
-	errCh         chan error
-	status        atomic.Value
+
+	errCh  chan error
+	status atomic.Value
+	hash   uint32 // calculated from priority + layerDigest
 }
 
 func withImageUnpackJob(image *imageUnpackJob) layerUnpackJobOption {
@@ -633,7 +726,7 @@ func withImageUnpackJob(image *imageUnpackJob) layerUnpackJobOption {
 
 // Note: unpacker needs to provide same errCh for all layers associated with a ingest so
 // the channel is correctly sized.
-func newLayerUnpackJob(layerDigest string, storage LayerUnpackJobStorage, opts ...layerUnpackJobOption) (*layerUnpackJob, error) {
+func newLayerUnpackJob(layerDigest string, storage LayerUnpackJobStorage, priority int, opts ...layerUnpackJobOption) (*layerUnpackJob, error) {
 	id, err := storage.Create()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new layer unpack job in storage for layer %s: %w", layerDigest, err)
@@ -645,6 +738,7 @@ func newLayerUnpackJob(layerDigest string, storage LayerUnpackJobStorage, opts .
 	}
 
 	luj := &layerUnpackJob{
+		priority:      priority,
 		layerUnpackID: id,
 		layerDigest:   layerDigest,
 		ingestPath:    filepath.Join(path, layerDigest),
@@ -662,35 +756,36 @@ func newLayerUnpackJob(layerDigest string, storage LayerUnpackJobStorage, opts .
 	return luj, nil
 }
 
-func (job *layerUnpackJob) AcquireDownload(ctx context.Context, n int64) error {
-	if err := job.concurrentDownloadsLimiter.Acquire(ctx, n); err != nil {
+func (job *layerUnpackJob) AcquireDownload(ctx context.Context, loopPos int64) error {
+	hash := CreateHash(job.layerDigest, job.priority, loopPos)
+	if err := job.concurrentDownloadsLimiter.Acquire(ctx, job.priority, hash); err != nil {
 		return err
 	}
-	return job.globalConcurrentDownloadsLimiter.Acquire(ctx, n)
+	return job.globalConcurrentDownloadsLimiter.Acquire(ctx, job.priority, hash)
 }
 
-func (job *layerUnpackJob) ReleaseDownload(n int64) {
-	job.concurrentDownloadsLimiter.Release(n)
-	job.globalConcurrentDownloadsLimiter.Release(n)
+func (job *layerUnpackJob) ReleaseDownload() {
+	job.concurrentDownloadsLimiter.Release()
+	job.globalConcurrentDownloadsLimiter.Release()
 }
 
 // AcquireUnpackLease is a blocking call to acquire the bandwidth to unpack a layer in parallel.
 // A closure function is returned for freeing resources along with an error if the allocation is unsuccessful.
 func (job *layerUnpackJob) AcquireUnpackLease(ctx context.Context) (func(), error) {
-	if err := job.concurrentUnpacksLimiter.Acquire(ctx, 1); err != nil {
+	if err := job.concurrentUnpacksLimiter.Acquire(ctx, job.priority, 0); err != nil {
 		return nil, err
 	}
 
-	if err := job.globalConcurrentUnpacksLimiter.Acquire(ctx, 1); err != nil {
+	if err := job.globalConcurrentUnpacksLimiter.Acquire(ctx, job.priority, 0); err != nil {
 		// Context was cancelled before global lock was acquired; release the per image lock
 		// that was already acquired.
-		job.concurrentUnpacksLimiter.Release(1)
+		job.concurrentUnpacksLimiter.Release()
 		return nil, err
 	}
 
 	return func() {
-		job.concurrentUnpacksLimiter.Release(1)
-		job.globalConcurrentUnpacksLimiter.Release(1)
+		job.concurrentUnpacksLimiter.Release()
+		job.globalConcurrentUnpacksLimiter.Release()
 	}, nil
 }
 

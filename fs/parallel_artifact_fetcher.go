@@ -178,7 +178,7 @@ func (f *parallelArtifactFetcher) fetchFromRemoteAndWriteToTempDir(ctx context.C
 			break
 		}
 
-		err := f.layerUnpackJob.AcquireDownload(ctx, 1)
+		err := f.layerUnpackJob.AcquireDownload(ctx, i)
 		if err != nil {
 			return nil, fmt.Errorf("error acquiring semaphore: %w", err)
 		}
@@ -195,7 +195,7 @@ func (f *parallelArtifactFetcher) fetchFromRemoteAndWriteToTempDir(ctx context.C
 		}
 
 		eg.Go(func() error {
-			defer f.layerUnpackJob.ReleaseDownload(1)
+			defer f.layerUnpackJob.ReleaseDownload()
 
 			var err error
 			defer func() {
