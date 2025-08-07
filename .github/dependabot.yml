@@ -14,6 +14,8 @@ updates:
           - '*'
     schedule:
       interval: "daily"
+    allow:
+      - dependency-type: all
     ignore:
       # skip grpc because the current latest not compatible with containerd 1.7
       # skip k8s deps since they use the latest go version/features that may
