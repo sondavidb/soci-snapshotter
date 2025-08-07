@@ -3,7 +3,7 @@ updates:
 
   # Automatic upgrade for go modules.
   - package-ecosystem: "gomod"
-    directories: ["/", "/cmd"]
+    directories: ["/"]
     groups:
       go:
         # Group all of our updates in one PR.
@@ -21,6 +21,22 @@ updates:
       - dependency-name: "github.com/awslabs/soci-snapshotter"
       - dependency-name: "google.golang.org/grpc"
       - dependency-name: "k8s.io/*"
+  - package-ecosystem: "gomod"
+    directories: ["/cmd"]
+    groups:
+      go:
+        patterns:
+          - '*'
+    schedule:
+      interval: "daily"
+    ignore:
+      # skip grpc because the current latest not compatible with containerd 1.7
+      # skip k8s deps since they use the latest go version/features that may
+      # not be in the go version soci uses
+      - dependency-name: "github.com/awslabs/soci-snapshotter"
+      - dependency-name: "google.golang.org/grpc"
+      - dependency-name: "k8s.io/*"
+    dependency-type: all
 
   # Automatic update for base images used in the Dockerfile
   - package-ecosystem: "docker"
