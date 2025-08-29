@@ -40,7 +40,9 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/awslabs/soci-snapshotter/fs/layer"
@@ -54,6 +56,46 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+func TestConfigTypeChecking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Order matters here — if the index of fsTypes and cfgTypes are the same,
+	// the tests should not return ErrWrongFSConfig. If it is not the same,
+	// it should return ErrWrongFSConfig.
+	fsTypes := []snapshot.FileSystem{&remoteFS{}, &localFS{}, &parallelFS{}}
+	cfgTypes := []any{
+		&snapshot.RemoteCfg{GetSources: emptyGetSources()},
+		&snapshot.LocalCfg{GetSources: emptyGetSources()},
+		&snapshot.ParallelCfg{GetSources: emptyGetSources()},
+	}
+
+	for i, fs := range fsTypes {
+		for j, cfg := range cfgTypes {
+			t.Run(fmt.Sprintf("run %s FS with %s", fs.Type(), reflect.TypeOf(cfg)), func(t *testing.T) {
+				// t.Parallel()
+				// To avoid segfault
+				err := fs.Mount(ctx, "", cfg)
+				if errors.Is(err, snapshot.ErrWrongFSConfig) {
+					if i == j {
+						t.Fatalf("expected correct config to be passed but got %v", err)
+					}
+				} else {
+					if i != j {
+						t.Fatalf("expected %v but got %v", snapshot.ErrWrongFSConfig, err)
+					}
+				}
+			})
+
+		}
+	}
+}
+
+func emptyGetSources() func(source.GetSources) ([]source.Source, error) {
+	return func(source.GetSources) ([]source.Source, error) {
+		return []source.Source{}, nil
+	}
+}
 
 func TestCheck(t *testing.T) {
 

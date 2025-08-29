@@ -96,36 +96,6 @@ var (
 	ErrNoNamespace = errors.New("context has no namespace attached")
 )
 
-type FSType string
-
-var (
-	RemoteFS   FSType = "remote"
-	LocalFS    FSType = "local"
-	ParallelFS FSType = "parallel"
-	OtherFS    FSType = "other"
-)
-
-// FileSystem is a backing filesystem abstraction.
-//
-// Type() returns the type of filesystem being used
-// Mount() tries to mount a remote snapshot to the specified mount point
-// directory. If succeed, the mountpoint directory will be treated as a layer
-// snapshot. If Mount() fails, the mountpoint directory MUST be cleaned up.
-// Check() is called to check the connectibity of the existing layer snapshot
-// every time the layer is used by containerd.
-// Unmount() is called to unmount a remote snapshot from the specified mount point
-// directory.
-// IDMapMount() is called to mount a mountpoint with ID-mapping. If the backing FS
-// does not support ID-mapping, this should return an error.
-type FileSystem interface {
-	Type() FSType
-	Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error
-	IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmap idtools.IDMap) (string, error)
-	Check(ctx context.Context, mountpoint string, labels map[string]string) error
-	Unmount(ctx context.Context, mountpoint string) error
-	CleanImage(ctx context.Context, digest string) error
-}
-
 // SnapshotterConfig is used to configure the remote snapshotter instance
 type SnapshotterConfig struct {
 	asyncRemove bool
@@ -1045,13 +1015,25 @@ func (o *snapshotter) prepareSnapshot(ctx context.Context, fsType FSType, key st
 	switch fsType {
 	case RemoteFS:
 		log.G(ctx).Infof("preparing remote filesystem mount at mountpoint=%v", mountpoint)
-		return o.remoteFS.Mount(ctx, mountpoint, labels, mounts)
+		cfg, err := NewRemoteCfg(labels)
+		if err != nil {
+			return err
+		}
+		return o.remoteFS.Mount(ctx, mountpoint, cfg)
 	case LocalFS:
 		log.G(ctx).Infof("preparing local filesystem mount at mountpoint=%v", mountpoint)
-		return o.localFS.Mount(ctx, mountpoint, labels, mounts)
+		cfg, err := NewLocalCfg(labels, mounts)
+		if err != nil {
+			return err
+		}
+		return o.localFS.Mount(ctx, mountpoint, cfg)
 	case ParallelFS:
 		log.G(ctx).Infof("preparing parallel filesystem mount at mountpoint=%v", mountpoint)
-		return o.parallelFS.Mount(ctx, mountpoint, labels, mounts)
+		cfg, err := NewParallelCfg(labels)
+		if err != nil {
+			return err
+		}
+		return o.parallelFS.Mount(ctx, mountpoint, cfg)
 	}
 
 	return fmt.Errorf("unrecognized filesystem type: %s", fsType)

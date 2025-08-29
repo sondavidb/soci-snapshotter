@@ -78,7 +78,6 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
-	ctdsnapshotters "github.com/containerd/containerd/pkg/snapshotters"
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/errdefs"
@@ -372,29 +371,28 @@ func (fs *remoteFS) Type() snapshot.FSType {
 	return snapshot.RemoteFS
 }
 
-func (fs *remoteFS) Mount(ctx context.Context, mountpoint string, labels map[string]string, _ []mount.Mount) (retErr error) {
+func (fs *remoteFS) Mount(ctx context.Context, mountpoint string, cfg any) (retErr error) {
+	fsCfg, ok := cfg.(*snapshot.RemoteCfg)
+	if !ok {
+		return snapshot.ErrWrongConfigFunc(fs)
+	}
 	// Setting the start time to measure the Mount operation duration.
 	start := time.Now()
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("mountpoint", mountpoint))
 
 	// If this is empty or the label doesn't exist, then we will use the referrers API later
 	// to get find an index digest.
-	sociIndexDigest := labels[source.TargetSociIndexDigestLabel]
-	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
-	if !ok {
-		return fmt.Errorf("unable to get image ref from labels")
-	}
-	imgDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
-	if !ok {
-		return fmt.Errorf("unable to get image digest from labels")
-	}
+	sociIndexDigest := fsCfg.SociIndexDigest
+	imageRef := fsCfg.ImageRef
+	imgDigest := fsCfg.ImageManifestDigest
+	layerDigest := fsCfg.TargetLayerDigest
 
 	// Get source information of this layer.
-	src, err := fs.getSources(labels)
+	src, err := fsCfg.GetSources(fs.getSources)
 	if err != nil {
 		return err
 	} else if len(src) == 0 {
-		return fmt.Errorf("source must be passed")
+		return errors.New("source must be passed")
 	}
 	client := src[0].Hosts[0].Client
 	c, err := fs.getSociContext(ctx, imageRef, sociIndexDigest, imgDigest, client)
@@ -471,9 +469,9 @@ func (fs *remoteFS) Mount(ctx context.Context, mountpoint string, labels map[str
 	case <-time.After(fs.mountTimeout):
 		log.G(ctx).WithFields(logrus.Fields{
 			"timeout":     fs.mountTimeout.String(),
-			"layerDigest": labels[ctdsnapshotters.TargetLayerDigestLabel],
+			"layerDigest": layerDigest,
 		}).Info("timeout waiting for layer to resolve")
-		retErr = fmt.Errorf("timeout waiting for layer %s to resolve", labels[ctdsnapshotters.TargetLayerDigestLabel])
+		retErr = fmt.Errorf("timeout waiting for layer %s to resolve", layerDigest)
 		return
 	}
 	defer func() {
@@ -502,7 +500,7 @@ func (fs *remoteFS) Mount(ctx context.Context, mountpoint string, labels map[str
 	// Pass in a logger to go-fuse with the layer digest
 	// The go-fuse logs are useful for tracing exactly what's happening at the fuse level.
 	fuseLogger := log.L.
-		WithField("layerDigest", labels[ctdsnapshotters.TargetLayerDigestLabel]).
+		WithField("layerDigest", layerDigest).
 		WriterLevel(logrus.TraceLevel)
 
 	retErr = fs.setupFuseServer(ctx, mountpoint, node, l, fuseLogger, c)
@@ -812,17 +810,18 @@ func (fs *localFS) Type() snapshot.FSType {
 	return snapshot.LocalFS
 }
 
-func (fs *localFS) Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
-	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
+func (fs *localFS) Mount(ctx context.Context, mountpoint string, cfg any) error {
+	fsCfg, ok := cfg.(*snapshot.LocalCfg)
 	if !ok {
-		return fmt.Errorf("unable to get image ref from labels")
+		return snapshot.ErrWrongConfigFunc(fs)
 	}
+	imageRef := fsCfg.ImageRef
 	// Get source information of this layer.
-	src, err := fs.getSources(labels)
+	src, err := fsCfg.GetSources(fs.getSources)
 	if err != nil {
 		return err
 	} else if len(src) == 0 {
-		return fmt.Errorf("blob info not found for any labels in %s", fmt.Sprint(labels))
+		return errors.New("source must be passed")
 	}
 	// download the target layer
 	s := src[0]
@@ -857,10 +856,7 @@ func (fs *localFS) Mount(ctx context.Context, mountpoint string, labels map[stri
 		}
 	}
 
-	imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
-	if !ok {
-		return errors.New("layer has no image manifest attached")
-	}
+	imageDigest := fsCfg.ImageManifestDigest
 	manifest, err := getImageManifest(ctx, fs.containerd, imageDigest)
 	if err != nil {
 		return fmt.Errorf("cannot get image manifest: %w", err)
@@ -877,7 +873,7 @@ func (fs *localFS) Mount(ctx context.Context, mountpoint string, labels map[stri
 	archive := NewLayerArchive(nil, uncompressedDigest.Verifier(), nil)
 	unpacker := NewLayerUnpacker(fetcher, archive)
 
-	err = unpacker.Unpack(ctx, desc, mountpoint, mounts)
+	err = unpacker.Unpack(ctx, desc, mountpoint, fsCfg.Mounts)
 	if err != nil {
 		return fmt.Errorf("cannot unpack the layer: %w", err)
 	}
@@ -970,21 +966,22 @@ func (fs *parallelFS) Type() snapshot.FSType {
 	return snapshot.ParallelFS
 }
 
-func (fs *parallelFS) Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
+func (fs *parallelFS) Mount(ctx context.Context, mountpoint string, cfg any) error {
+	fsCfg, ok := cfg.(*snapshot.ParallelCfg)
+	if !ok {
+		return snapshot.ErrWrongConfigFunc(fs)
+	}
 	if !fs.parallelCfg.Enable {
 		return ErrParallelPullIsDisabled
 	}
 
-	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
-	if !ok {
-		return fmt.Errorf("unable to get image ref from labels")
-	}
+	imageRef := fsCfg.ImageRef
 	// Get source information of this layer.
-	src, err := fs.getSources(labels)
+	src, err := fsCfg.GetSources(fs.getSources)
 	if err != nil {
 		return err
 	} else if len(src) == 0 {
-		return fmt.Errorf("blob info not found for any labels in %s", fmt.Sprint(labels))
+		return errors.New("source must be passed")
 	}
 	// download the target layer
 	s := src[0]
@@ -994,10 +991,7 @@ func (fs *parallelFS) Mount(ctx context.Context, mountpoint string, labels map[s
 		return fmt.Errorf("cannot parse image ref (%s): %w", imageRef, err)
 	}
 	desc := s.Target
-	imageDigest, ok := labels[ctdsnapshotters.TargetManifestDigestLabel]
-	if !ok {
-		return errors.New("layer has no image manifest attached")
-	}
+	imageDigest := fsCfg.ImageManifestDigest
 	// If lazy-loading is disabled and the image has no jobs associated with it, start premounting all jobs
 	if !fs.inProgressImageUnpacks.ImageExists(imageDigest) {
 		err := fs.preloadAllLayers(ctx, desc, imageDigest, refspec, client)

@@ -386,12 +386,20 @@ type bindFs struct {
 	broken       map[string]bool
 }
 
+type bindCfg struct {
+	labels map[string]string
+}
+
 func (fs *bindFs) Type() FSType {
 	return OtherFS
 }
 
-func (fs *bindFs) Mount(ctx context.Context, mountpoint string, labels map[string]string, _ []mount.Mount) error {
-	if _, ok := labels[brokenLabel]; ok {
+func (fs *bindFs) Mount(ctx context.Context, mountpoint string, cfg any) error {
+	fsCfg, ok := cfg.(*bindCfg)
+	if !ok {
+		return ErrWrongConfigFunc(fs)
+	}
+	if _, ok := fsCfg.labels[brokenLabel]; ok {
 		fs.broken[mountpoint] = true
 	}
 	if err := syscall.Mount(fs.root, mountpoint, "none", syscall.MS_BIND, ""); err != nil {
@@ -447,7 +455,7 @@ func (fs *dummyFs) Type() FSType {
 	return OtherFS
 }
 
-func (fs *dummyFs) Mount(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
+func (fs *dummyFs) Mount(ctx context.Context, mountpoint string, cfg any) error {
 	return fmt.Errorf("dummy")
 }
 
