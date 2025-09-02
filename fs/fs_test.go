@@ -64,7 +64,7 @@ func TestConfigTypeChecking(t *testing.T) {
 	// the tests should not return ErrWrongFSConfig. If it is not the same,
 	// it should return ErrWrongFSConfig.
 	fsTypes := []snapshot.FileSystem{&remoteFS{}, &localFS{}, &parallelFS{}}
-	cfgTypes := []any{
+	cfgTypes := []snapshot.FSCfg{
 		&snapshot.RemoteCfg{GetSources: emptyGetSources()},
 		&snapshot.LocalCfg{GetSources: emptyGetSources()},
 		&snapshot.ParallelCfg{GetSources: emptyGetSources()},

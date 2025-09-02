@@ -32,6 +32,7 @@ var ErrWrongFSConfig error = errors.New("incorrect FS config type")
 // FileSystem is a backing filesystem abstraction.
 //
 // Type() returns the type of filesystem being used
+// This should return the same type as the FSCfg implementation of this FileSystem
 // Mount() tries to mount a remote snapshot to the specified mount point
 // directory. If succeed, the mountpoint directory will be treated as a layer
 // snapshot. If Mount() fails, the mountpoint directory MUST be cleaned up.
@@ -43,11 +44,17 @@ var ErrWrongFSConfig error = errors.New("incorrect FS config type")
 // does not support ID-mapping, this should return an error.
 type FileSystem interface {
 	Type() FSType
-	Mount(ctx context.Context, mountpoint string, cfg any) error
+	Mount(ctx context.Context, mountpoint string, cfg FSCfg) error
 	IDMapMount(ctx context.Context, mountpoint, activeLayerID string, idmap idtools.IDMap) (string, error)
 	Check(ctx context.Context, mountpoint string, labels map[string]string) error
 	Unmount(ctx context.Context, mountpoint string) error
 	CleanImage(ctx context.Context, digest string) error
+}
+
+// Type() returns the type of filesystem being used.
+// This should return the same type as the FileSystem implementation of this FSCfg
+type FSCfg interface {
+	Type() FSType
 }
 
 type FSType string
@@ -91,6 +98,10 @@ func NewRemoteCfg(labels map[string]string) (*RemoteCfg, error) {
 	return cfg, nil
 }
 
+func (*RemoteCfg) Type() FSType {
+	return RemoteFS
+}
+
 type LocalCfg struct {
 	ImageRef            string
 	ImageManifestDigest string
@@ -121,6 +132,10 @@ func NewLocalCfg(labels map[string]string, mounts []mount.Mount) (*LocalCfg, err
 	return cfg, nil
 }
 
+func (*LocalCfg) Type() FSType {
+	return LocalFS
+}
+
 type ParallelCfg struct {
 	ImageRef            string
 	ImageManifestDigest string
@@ -143,6 +158,10 @@ func NewParallelCfg(labels map[string]string) (*ParallelCfg, error) {
 	}
 
 	return cfg, nil
+}
+
+func (*ParallelCfg) Type() FSType {
+	return ParallelFS
 }
 
 func ErrWrongConfigFunc(fs FileSystem) error {

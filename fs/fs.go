@@ -371,11 +371,11 @@ func (fs *remoteFS) Type() snapshot.FSType {
 	return snapshot.RemoteFS
 }
 
-func (fs *remoteFS) Mount(ctx context.Context, mountpoint string, cfg any) (retErr error) {
-	fsCfg, ok := cfg.(*snapshot.RemoteCfg)
-	if !ok {
+func (fs *remoteFS) Mount(ctx context.Context, mountpoint string, cfg snapshot.FSCfg) (retErr error) {
+	if fs.Type() != cfg.Type() {
 		return snapshot.ErrWrongConfigFunc(fs)
 	}
+	fsCfg := cfg.(*snapshot.RemoteCfg)
 	// Setting the start time to measure the Mount operation duration.
 	start := time.Now()
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("mountpoint", mountpoint))
@@ -810,11 +810,11 @@ func (fs *localFS) Type() snapshot.FSType {
 	return snapshot.LocalFS
 }
 
-func (fs *localFS) Mount(ctx context.Context, mountpoint string, cfg any) error {
-	fsCfg, ok := cfg.(*snapshot.LocalCfg)
-	if !ok {
+func (fs *localFS) Mount(ctx context.Context, mountpoint string, cfg snapshot.FSCfg) error {
+	if fs.Type() != cfg.Type() {
 		return snapshot.ErrWrongConfigFunc(fs)
 	}
+	fsCfg := cfg.(*snapshot.LocalCfg)
 	imageRef := fsCfg.ImageRef
 	// Get source information of this layer.
 	src, err := fsCfg.GetSources(fs.getSources)
@@ -966,7 +966,7 @@ func (fs *parallelFS) Type() snapshot.FSType {
 	return snapshot.ParallelFS
 }
 
-func (fs *parallelFS) Mount(ctx context.Context, mountpoint string, cfg any) error {
+func (fs *parallelFS) Mount(ctx context.Context, mountpoint string, cfg snapshot.FSCfg) error {
 	fsCfg, ok := cfg.(*snapshot.ParallelCfg)
 	if !ok {
 		return snapshot.ErrWrongConfigFunc(fs)

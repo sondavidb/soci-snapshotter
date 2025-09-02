@@ -41,6 +41,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/fs/layer"
 	"github.com/awslabs/soci-snapshotter/fs/source"
 	"github.com/awslabs/soci-snapshotter/service/resolver"
+	"github.com/awslabs/soci-snapshotter/snapshot"
 	snbase "github.com/awslabs/soci-snapshotter/snapshot"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/overlay/overlayutils"
@@ -107,6 +108,7 @@ func NewSociSnapshotterService(ctx context.Context, root string, serviceCfg *con
 	if serviceCfg.FSConfig.MaxConcurrency != 0 {
 		fsOpts = append(fsOpts, socifs.WithMaxConcurrency(serviceCfg.FSConfig.MaxConcurrency))
 	}
+	supportedFS := []snapshot.FSType{snapshot.RemoteFS, snapshot.LocalFS, snapshot.ParallelFS}
 	filesystems, err := socifs.NewFilesystems(ctx, fsRoot(root), serviceCfg.FSConfig, fsOpts...)
 	if err != nil {
 		log.G(ctx).WithError(err).Fatalf("failed to configure filesystem")
@@ -122,7 +124,7 @@ func NewSociSnapshotterService(ctx context.Context, root string, serviceCfg *con
 		snOpts = append(snOpts, snbase.AllowInvalidMountsOnRestart)
 	}
 
-	snapshotter, err = snbase.NewSnapshotter(ctx, snapshotterRoot(root), filesystems, snOpts...)
+	snapshotter, err = snbase.NewSnapshotter(ctx, snapshotterRoot(root), supportedFS, filesystems, snOpts...)
 	if err != nil {
 		log.G(ctx).WithError(err).Fatalf("failed to create new snapshotter")
 	}

@@ -35,6 +35,7 @@ package snapshot
 import (
 	"context"
 	_ "crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -73,7 +74,7 @@ func TestRemotePrepare(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := context.TODO()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{bindFileSystem(t)})
+	sn, err := NewSnapshotter(context.TODO(), root, []FSType{bindFSType}, []FileSystem{bindFileSystem(t)})
 	if err != nil {
 		t.Fatalf("failed to make new remote snapshotter: %q", err)
 	}
@@ -120,7 +121,7 @@ func TestRemoteOverlay(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := context.TODO()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{bindFileSystem(t)})
+	sn, err := NewSnapshotter(context.TODO(), root, []FSType{bindFSType}, []FileSystem{bindFileSystem(t)})
 	if err != nil {
 		t.Fatalf("failed to make new remote snapshotter: %q", err)
 	}
@@ -175,7 +176,7 @@ func TestRemoteCommit(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := context.TODO()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{bindFileSystem(t)})
+	sn, err := NewSnapshotter(context.TODO(), root, []FSType{bindFSType}, []FileSystem{bindFileSystem(t)})
 	if err != nil {
 		t.Fatalf("failed to make new remote snapshotter: %q", err)
 	}
@@ -306,7 +307,7 @@ func TestFailureDetection(t *testing.T) {
 			ctx := context.TODO()
 			root := t.TempDir()
 			fi := bindFileSystem(t)
-			sn, err := NewSnapshotter(context.TODO(), root, []FileSystem{fi})
+			sn, err := NewSnapshotter(context.TODO(), root, []FSType{bindFSType}, []FileSystem{fi})
 			if err != nil {
 				t.Fatalf("failed to make new Snapshotter: %q", err)
 			}
@@ -379,6 +380,8 @@ func bindFileSystem(t *testing.T) FileSystem {
 	}
 }
 
+var bindFSType FSType
+
 type bindFs struct {
 	t            *testing.T
 	root         string
@@ -390,11 +393,15 @@ type bindCfg struct {
 	labels map[string]string
 }
 
-func (fs *bindFs) Type() FSType {
-	return OtherFS
+func (*bindCfg) Type() FSType {
+	return bindFSType
 }
 
-func (fs *bindFs) Mount(ctx context.Context, mountpoint string, cfg any) error {
+func (fs *bindFs) Type() FSType {
+	return bindFSType
+}
+
+func (fs *bindFs) Mount(ctx context.Context, mountpoint string, cfg FSCfg) error {
 	fsCfg, ok := cfg.(*bindCfg)
 	if !ok {
 		return ErrWrongConfigFunc(fs)
@@ -447,15 +454,23 @@ func (fs *bindFs) CleanImage(ctx context.Context, digest string) error {
 	return nil
 }
 
+var dummyFSType FSType = "dummy"
+
 func dummyFileSystem() FileSystem { return &dummyFs{} }
+
+type dummyFsCfg struct{}
+
+func (*dummyFsCfg) Type() FSType {
+	return dummyFSType
+}
 
 type dummyFs struct{}
 
 func (fs *dummyFs) Type() FSType {
-	return OtherFS
+	return dummyFSType
 }
 
-func (fs *dummyFs) Mount(ctx context.Context, mountpoint string, cfg any) error {
+func (fs *dummyFs) Mount(ctx context.Context, mountpoint string, cfg FSCfg) error {
 	return fmt.Errorf("dummy")
 }
 
@@ -491,7 +506,7 @@ func (fs *dummyFs) CleanImage(ctx context.Context, digest string) error {
 // Tests backword-comaptibility of overlayfs snapshotter.
 
 func newSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
-	snapshotter, err := NewSnapshotter(context.TODO(), root, []FileSystem{dummyFileSystem()})
+	snapshotter, err := NewSnapshotter(context.TODO(), root, []FSType{dummyFSType}, []FileSystem{dummyFileSystem()})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -757,5 +772,88 @@ func TestOverlayView(t *testing.T) {
 	}
 	if requiresUserXattrs && m.Options[1] != "userxattr" {
 		t.Errorf("expected userxattr option, but got %s", m.Options[1])
+	}
+}
+
+func TestSupportedFS(t *testing.T) {
+	tests := []struct {
+		name        string
+		supportedFS []FSType
+		givenFS     []FileSystem
+	}{
+		{
+			name:        "single given FS exists in single supported FSType array",
+			supportedFS: []FSType{dummyFSType},
+			givenFS:     []FileSystem{&dummyFs{}},
+		},
+		{
+			name:        "single given FS exists in multiple supported FSType array",
+			supportedFS: []FSType{bindFSType, dummyFSType},
+			givenFS:     []FileSystem{&dummyFs{}},
+		},
+		{
+			name:        "given FS does not exist in supported FSType array",
+			supportedFS: []FSType{ParallelFS, bindFSType},
+			givenFS:     []FileSystem{&dummyFs{}},
+		},
+		{
+			name:        "given FS is duplicated",
+			supportedFS: []FSType{dummyFSType},
+			givenFS:     []FileSystem{&dummyFs{}, &dummyFs{}},
+		},
+		{
+			name:        "no supported FSType given",
+			supportedFS: []FSType{},
+			givenFS:     []FileSystem{bindFileSystem(t)},
+		},
+		{
+			name:        "no FS passed in",
+			supportedFS: []FSType{dummyFSType},
+			givenFS:     []FileSystem{},
+		},
+	}
+
+	expectedErrFunc := func(supportedFS []FSType, givenFS []FileSystem) error {
+		if len(supportedFS) == 0 || len(givenFS) == 0 {
+			return ErrBadFilesytemArgs
+		}
+
+		foundMap := make(map[FSType]bool)
+
+		for _, fs := range givenFS {
+			ok := false
+			givenType := fs.Type()
+			for _, suppType := range supportedFS {
+				if suppType == givenType {
+					_, ok = foundMap[givenType]
+					// We should error out if multiple of the same FS type is given
+					if ok {
+						return ErrFilesystemExists
+					}
+					foundMap[givenType] = true
+					ok = true
+				}
+			}
+			if !ok {
+				return ErrUnrecognizedFilesystem
+			}
+		}
+
+		return nil
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			root := t.TempDir()
+			_, err := NewSnapshotter(ctx, root, tt.supportedFS, tt.givenFS)
+			expectedErr := expectedErrFunc(tt.supportedFS, tt.givenFS)
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("expected error message (%v) but got (%v)", expectedErr, err)
+			}
+		})
 	}
 }
