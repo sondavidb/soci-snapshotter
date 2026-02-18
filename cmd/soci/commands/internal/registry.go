@@ -36,48 +36,61 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
+const (
+	SkipVerifyFlag = "skip-verify"
+	PlainHttpFlag  = "plain-http"
+	UserFlag       = "user"
+	RefreshFlag    = "refresh"
+	HostsDirFlag   = "hosts-dir"
+	TlsCaCertFlag  = "tlscacert"
+	TlsCertFlag    = "tlscert"
+	TlsKeyFlag     = "tlskey"
+	HttpDumpFlag   = "http-dump"
+	HttpTraceFlag  = "http-trace"
+)
+
 var RegistryFlags = []cli.Flag{
 	&cli.BoolFlag{
-		Name:    "skip-verify",
+		Name:    SkipVerifyFlag,
 		Aliases: []string{"k"},
 		Usage:   "Skip SSL certificate validation",
 	},
 	&cli.BoolFlag{
-		Name:  "plain-http",
+		Name:  PlainHttpFlag,
 		Usage: "Allow connections using plain HTTP",
 	},
 	&cli.StringFlag{
-		Name:    "user",
+		Name:    UserFlag,
 		Aliases: []string{"u"},
 		Usage:   "User[:password] Registry user and password",
 	},
 	&cli.StringFlag{
-		Name:  "refresh",
+		Name:  RefreshFlag,
 		Usage: "Refresh token for authorization server",
 	},
 	&cli.StringFlag{
-		Name: "hosts-dir",
+		Name: HostsDirFlag,
 		// compatible with "/etc/docker/certs.d"
 		Usage: "Custom hosts configuration directory",
 	},
 	&cli.StringFlag{
-		Name:  "tlscacert",
+		Name:  TlsCaCertFlag,
 		Usage: "Path to TLS root CA",
 	},
 	&cli.StringFlag{
-		Name:  "tlscert",
+		Name:  TlsCertFlag,
 		Usage: "Path to TLS client certificate",
 	},
 	&cli.StringFlag{
-		Name:  "tlskey",
+		Name:  TlsKeyFlag,
 		Usage: "Path to TLS client key",
 	},
 	&cli.BoolFlag{
-		Name:  "http-dump",
+		Name:  HttpDumpFlag,
 		Usage: "Dump all HTTP request/responses when interacting with container registry",
 	},
 	&cli.BoolFlag{
-		Name:  "http-trace",
+		Name:  HttpTraceFlag,
 		Usage: "Enable HTTP tracing for registry interactions",
 	},
 }
