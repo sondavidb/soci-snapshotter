@@ -70,10 +70,10 @@ type spanInfo struct {
 // spans based on the ztoc.
 
 // TODO: return errors/nil objects on failure
-func New(ztoc *ztoc.Ztoc, r *io.SectionReader, cache cache.BlobCache, retries int, cacheOpt ...cache.Option) *SpanManager {
+func New(ztoc *ztoc.Ztoc, r *io.SectionReader, cache cache.BlobCache, retries int, cacheOpt ...cache.Option) (*SpanManager, error) {
 	index, err := ztoc.Zinfo()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	ztoc.Checkpoints = nil
 
@@ -81,10 +81,16 @@ func New(ztoc *ztoc.Ztoc, r *io.SectionReader, cache cache.BlobCache, retries in
 	// This also serves as a sanity check to make sure the file isn't corrupted.
 	b := make([]byte, index.StartCompressedOffset(0))
 	if _, err := r.Read(b); err != nil {
-		log.L.Errorf("unable to read ztoc header: %v", err)
+		return nil, fmt.Errorf("unable to read ztoc header: %v", err)
 	}
 	if err := index.VerifyHeader(bytes.NewReader(b)); err != nil {
-		log.L.Errorf("unable to verify %v header: %v", ztoc.CompressionAlgorithm, err)
+		return nil, fmt.Errorf("unable to verify %v header: %v", ztoc.CompressionAlgorithm, err)
+	}
+
+	// Sanity check the MaxSpanID reported by the zTOC
+	lenSpanDigests := int32(len(ztoc.SpanDigests))
+	if lenSpanDigests-1 != int32(ztoc.MaxSpanID) {
+		return nil, fmt.Errorf("Expected zTOC MaxSpanID to be %d but zTOC reported %d", lenSpanDigests-1, ztoc.MaxSpanID)
 	}
 
 	spans := make([]*span, ztoc.MaxSpanID+1)
@@ -105,7 +111,7 @@ func New(ztoc *ztoc.Ztoc, r *io.SectionReader, cache cache.BlobCache, retries in
 		m.Close()
 	})
 
-	return m
+	return m, nil
 }
 
 func (m *SpanManager) buildAllSpans() {

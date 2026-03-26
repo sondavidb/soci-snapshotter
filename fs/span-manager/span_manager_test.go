@@ -28,6 +28,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/util/testutil"
 	"github.com/awslabs/soci-snapshotter/ztoc"
 	"github.com/awslabs/soci-snapshotter/ztoc/compression"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestSpanManager(t *testing.T) {
@@ -90,7 +91,8 @@ func TestSpanManager(t *testing.T) {
 
 			cache := cache.NewMemoryCache()
 			defer cache.Close()
-			m := New(toc, r, cache, 0)
+			m, err := New(toc, r, cache, 0)
+			assert.NotNil(t, err)
 
 			// Test GetContent
 			fileContentFromSpans, err := getFileContentFromSpans(m, toc, fileName)
@@ -133,7 +135,8 @@ func TestSpanManagerCache(t *testing.T) {
 	}
 	cache := cache.NewMemoryCache()
 	defer cache.Close()
-	m := New(toc, r, cache, 0)
+	m, err := New(toc, r, cache, 0)
+	assert.NotNil(t, err)
 	spanID := 0
 	err = m.resolveSpan(compression.SpanID(spanID))
 	if err != nil {
@@ -188,7 +191,8 @@ func TestStateTransition(t *testing.T) {
 	}
 	cache := cache.NewMemoryCache()
 	defer cache.Close()
-	m := New(toc, r, cache, 0)
+	m, err := New(toc, r, cache, 0)
+	assert.NotNil(t, err)
 
 	// check initial span states
 	for i := uint32(0); i <= uint32(toc.MaxSpanID); i++ {
@@ -356,7 +360,8 @@ func TestSpanManagerRetries(t *testing.T) {
 			}
 			rdr := &retryableReaderAt{inner: sr, maxErrors: tc.readerErrors}
 			sr = io.NewSectionReader(rdr, 0, 10000000)
-			sm := New(ztoc, sr, cache.NewMemoryCache(), tc.spanManagerRetries)
+			sm, err := New(ztoc, sr, cache.NewMemoryCache(), tc.spanManagerRetries)
+			assert.NotNil(t, err)
 
 			for i := 0; i < int(ztoc.MaxSpanID); i++ {
 				rdr.errCount = 0
