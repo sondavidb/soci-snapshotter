@@ -84,16 +84,17 @@ jobs:
       - name: Set vars for push
         if: github.event_name == 'push'
         run: |
-          # curl GitHub API to get latest tag based on the branch that was pushed to and increment patch version
-          latest_tag=$(curl -s https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/releases | grep "tag_name" | cut -d '"' -f 4 | grep ${{ github.ref_name }} | head -n 1 | awk -F. -v OFS=. '{$NF += 1 ; print}')
-
-          # Fallback if tag isn't found, assume major.minor.0
           branch_name=${{ github.ref_name }}
           major_minor=${branch_name#*/}
+
+          # curl GitHub API to get latest tag based on the branch that was pushed to
+          latest_tag=$(curl -s https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/releases | grep "tag_name" | cut -d '"' -f 4 | grep ${major_minor} | head -n 1)
+
+          # Fallback if tag isn't found, assume major.minor.0
           if [ -z "$latest_tag" ]; then latest_tag="v${major_minor}.0"; fi
 
-          # Increment patch ver
-          echo "TAG_NAME=$(echo ${latest_tag})" >> $GITHUB_ENV
+          # Increment patch ver, since push action implies we are updating an existing release branch
+          echo "TAG_NAME=$(echo ${latest_tag} | awk -F. -v OFS=. '{$NF += 1 ; print}')" >> $GITHUB_ENV
           echo "TARGET_BRANCH=${{ github.ref_name }}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v6
