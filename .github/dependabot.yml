@@ -6,6 +6,11 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    allow:
+      # Only allow patch version bumps for containerd
+      - dependency-name: "github.containerd/containerd/v2"
+        update-types:
+          - "version-update:semver-patch"
     ignore:
       # skip k8s deps since they use the latest go version/features that may not be in the go version soci uses
       # Also ignored in /scripts/bump-deps.sh
