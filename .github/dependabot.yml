@@ -6,6 +6,11 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    allow:
+      # Only allow patch version bumps for containerd as minor version bumps should be intentional
+      - dependency-name: "github.com/containerd/containerd/v2"
+        update-types:
+          - "version-update:semver-patch"
     ignore:
       # skip k8s deps since they use the latest go version/features that may not be in the go version soci uses
       # Also ignored in /scripts/bump-deps.sh
@@ -16,6 +21,11 @@ updates:
     directory: "/cmd"
     schedule:
       interval: "daily"
+    allow:
+      # Only allow patch version bumps for containerd as minor version bumps should be intentional
+      - dependency-name: "github.com/containerd/containerd/v2"
+        update-types:
+          - "version-update:semver-patch"
     ignore:
       # skip k8s deps and soci-snapshotter itself
       # Also ignored in /scripts/bump-deps.sh
