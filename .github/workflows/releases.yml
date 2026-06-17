@@ -19,7 +19,63 @@ permissions:
   deployments: write
 
 jobs:
+    # Ensure all the correct artifacts are in the release branch
+  check-release-branch-state:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+
+    env:
+      TARGET_BRANCH: '' # Filled in first steps
+
+    steps:
+      - name: Check provided tag is sensical
+        run: |
+          echo "${{ inputs.tag_name }}" | grep -qP '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          echo "Got tag ${{ inputs.tag_name }} from input"
+
+          # Make sure tag doesn't already exist upstream, this will fail if so
+          curl -s https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/releases | grep "tag_name" | cut -d '"' -f 4 | grep -vq ${{ inputs.tag_name }}
+
+      - name: Export release branch
+        run: |
+          echo "TARGET_BRANCH=release/$(echo ${{ inputs.tag_name }} | grep -Eo '[0-9]+\.[0-9]+')" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses/v2@v2.0.1
+
+      - name: Generate third party licenses file
+        run: bash scripts/build-third-party-licenses.sh
+
+      - name: Check diff is empty
+        run: git diff --exit-code
+
+      - name: Increment version in docs
+        run: bash scripts/update-version-in-docs.sh ${{ inputs.tag_name }}
+
+      - name: Check diff is empty
+        run: git diff --exit-code
+
+  # Placeholder job for pull request so that subsequent steps still run
+  ignore-on-pull-request:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Do nothing
+        run: true
+
   setup:
+    # Only run this if either of the previous two are a success.
+    # We still need this to run after the checks but don't need the checks on a PR.
+    needs: [check-release-branch-state, ignore-on-pull-request]
+    if: always() && (needs.check-release-branch-state.result == 'success' || needs.ignore-on-pull-request.result == 'success')
     uses: ./.github/workflows/setup.yml
 
   generate-artifacts:
