@@ -29,6 +29,7 @@ jobs:
           # Make sure tag doesn't already exist upstream, this will fail if so
           curl -s https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/releases | grep "tag_name" | cut -d '"' -f 4 | grep -vq ${{ inputs.tag_name }}
 
+
       - name: Export release branch
         run: |
           echo "TARGET_BRANCH=release/$(echo ${{ inputs.tag_name }} | grep -Eo '[0-9]+\.[0-9]+')" >> $GITHUB_ENV
