@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Do nothing
-        run: true
+        run: true && true
 
   setup:
     # Only run this if either of the previous two are a success.
